@@ -31,7 +31,7 @@ Y_TRAIN_PATH = APP_DIR / "y_train.csv"
 
 FIXED_THRESHOLD = 0.4629352474478095
 
-MODEL_ALIAS = "VE-EF"
+MODEL_ALIAS = "SVM_rbf"
 TARGET_MODEL_NAME = "SVM_rbf"
 
 APP_TITLE = "Prediction of Response to Immunotherapy Combined With Chemotherapy in Unresectable Advanced Gastric Cancer"
@@ -250,33 +250,6 @@ def plot_waterfall(explanation, total_features):
     plt.rcParams.update(old_rc)
     return fig
 
-def plot_top_contrib_bar(explanation, total_features):
-    values = np.array(explanation.values)
-    names = np.array(explanation.feature_names)
-    order = np.argsort(np.abs(values))[::-1]
-
-    vals = values[order]
-    labels = names[order]
-
-    # Increased width to 15 to accommodate long feature names
-    fig_height = max(6.2, total_features * 0.25)
-    fig, ax = plt.subplots(figsize=(15, fig_height), dpi=300)
-    
-    colors = ["#d9534f" if v > 0 else "#3b82f6" for v in vals]
-    ax.barh(range(len(vals)), vals[::-1], color=colors[::-1], edgecolor="none")
-    ax.set_yticks(range(len(vals)))
-    ax.set_yticklabels(labels[::-1], fontsize=9)
-    ax.set_xlabel("SHAP value", fontsize=11, fontweight="bold")
-    ax.set_title("All Feature Contributions", fontsize=13, fontweight="bold")
-    ax.axvline(0, color="black", linewidth=0.8)
-
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    # tight_layout automatically calculates boundaries so long text stays visible
-    plt.tight_layout()
-    return fig
-
 def plot_probability_bar(prob_pos):
     prob_neg = 1 - prob_pos
     labels = [NEGATIVE_LABEL_NAME, POSITIVE_LABEL_NAME]
@@ -380,9 +353,9 @@ st.markdown(f'<div class="note-card">The deployment uses a fixed decision thresh
 # =========================================================
 with st.sidebar:
     st.header("Model Overview")
-    st.write(f"**Model alias:** {MODEL_ALIAS}")
+    st.write(f"**Model:** {MODEL_ALIAS}")
     st.write(f"**Classifier:** {TARGET_MODEL_NAME}")
-    st.write(f"**Total Features:** {TOTAL_FEATURES} (Showing ALL)")
+    st.write(f"**Total Features:** {TOTAL_FEATURES}")
     st.write(f"**Decision threshold:** {FIXED_THRESHOLD:.6f}")
     st.markdown("---")
     st.caption("Research-use interface only. This tool does not replace clinical judgment.")
@@ -441,29 +414,26 @@ if submitted:
     st.pyplot(prob_fig, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.subheader("Model Explanation (SHAP - All Features)")
-    with st.spinner("Computing SHAP explanation for all features..."):
+    st.subheader("Model Explanation (SHAP)")
+    with st.spinner("Computing SHAP explanation..."):
         explanation_full = shap_for_single_case(explainer, input_df, nsamples=SHAP_NSAMPLES)
         force_exp = subset_explanation(explanation_full, top_n=TOTAL_FEATURES, for_force=True)
         full_exp = subset_explanation(explanation_full, top_n=TOTAL_FEATURES, for_force=False)
         shap_df = build_shap_table(explanation_full)
 
-    tab1, tab2, tab3 = st.tabs(["SHAP Force Plot (All)", "Waterfall / Contribution Plot (All)", "All Features Table"])
+    tab1, tab2, tab3 = st.tabs(["SHAP Force Plot", "Waterfall Plot", "Features Table"])
 
     with tab1:
-        st.caption(f"Interactive force plot for all {TOTAL_FEATURES} features.")
+        st.caption(f"Interactive force plot for the features.")
         render_force_plot_html(force_exp, height=290)
 
     with tab2:
-        st.caption(f"Waterfall plot and signed SHAP bar chart for all {TOTAL_FEATURES} features using original feature names.")
+        st.caption(f"Waterfall plot using original feature names.")
         fig1 = plot_waterfall(full_exp, total_features=TOTAL_FEATURES)
         st.pyplot(fig1, use_container_width=True)
 
-        fig2 = plot_top_contrib_bar(full_exp, total_features=TOTAL_FEATURES)
-        st.pyplot(fig2, use_container_width=True)
-
     with tab3:
-        st.caption(f"All {TOTAL_FEATURES} features ranked by absolute SHAP magnitude.")
+        st.caption(f"Features ranked by absolute SHAP magnitude.")
         display_df = shap_df.copy()
         for col in ["Input Value", "SHAP Value", "Absolute SHAP"]:
             display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
@@ -474,6 +444,6 @@ if submitted:
 # =========================================================
 st.markdown("""
 <div class="footer-note">
-Research-use interface for the multimodal VE-EF model. 
+Research-use interface for the multimodal model. 
 </div>
 """, unsafe_allow_html=True)
