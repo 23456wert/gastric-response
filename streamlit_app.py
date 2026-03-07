@@ -11,7 +11,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # =========================================================
-# 1. 页面设置
+# 1. Page Configuration
 # =========================================================
 st.set_page_config(
     page_title="UAGC Immunochemotherapy Response Predictor",
@@ -21,35 +21,30 @@ st.set_page_config(
 )
 
 # =========================================================
-# 2. 根目录文件
+# 2. File Paths & Constants
 # =========================================================
 APP_DIR = Path(__file__).resolve().parent
 
-# 注意：这里请与你实际文件名保持完全一致（Linux/Streamlit Cloud 区分大小写）
 MODEL_PATH = APP_DIR / "SVM_rbf.pkl"
 X_TRAIN_PATH = APP_DIR / "x_train.csv"
 Y_TRAIN_PATH = APP_DIR / "y_train.csv"
 
-# 固定阈值
 FIXED_THRESHOLD = 0.4629352474478095
 
-# 模型信息
 MODEL_ALIAS = "VE-EF"
-TARGET_MODEL_NAME = "SVM_RBF"
+TARGET_MODEL_NAME = "SVM_rbf"
 
-# 标题信息
 APP_TITLE = "Prediction of Response to Immunotherapy Combined With Chemotherapy in Unresectable Advanced Gastric Cancer"
 APP_SUBTITLE = "Multimodal venous-phase CT and elasticity radiomics model for individual treatment response estimation"
 
 POSITIVE_LABEL_NAME = "Responder (CR/PR)"
 NEGATIVE_LABEL_NAME = "Non-responder (SD/PD)"
 
-# SHAP 显示策略
 SHAP_NSAMPLES = 160
 BACKGROUND_N = 30
 
 # =========================================================
-# 3. 页面样式
+# 3. CSS Styling
 # =========================================================
 st.markdown("""
 <style>
@@ -73,7 +68,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================================================
-# 4. 工具函数
+# 4. Utility Functions
 # =========================================================
 def check_required_files():
     required = [MODEL_PATH, X_TRAIN_PATH, Y_TRAIN_PATH]
@@ -91,58 +86,24 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def infer_feature_group(feature_name: str) -> str:
-    """按要求修改为两大类特征组"""
     if "Elasticity" in feature_name:
-        return "Elasticity Features (弹性图特征)"
+        return "Elasticity Features"
     elif "Venous" in feature_name:
-        return "Venous-phase CT Features (静脉期CT特征)"
+        return "Venous-phase CT Features"
     else:
-        return "Other Features (其他特征)"
+        return "Other Features"
 
-def format_widget_label(name: str, max_len: int = 48) -> str:
-    s = name
-    s = s.replace("Venousperi_", "V-PERI · ")
-    s = s.replace("Elasticityperi_", "E-PERI · ")
-    s = s.replace("Venous_", "V-INTRA · ")
-    s = s.replace("Elasticity_", "E-INTRA · ")
-    s = s.replace("ResNet50Feat", "RN50")
-    s = s.replace("firstorder", "1stOrder")
-    s = s.replace("wavelet", "Wavelet")
-    s = s.replace("log_sigma", "LoG")
-    s = s.replace("glszm", "GLSZM")
-    s = s.replace("glcm", "GLCM")
-    s = s.replace("gldm", "GLDM")
-    s = s.replace("ngtdm", "NGTDM")
-    s = s.replace("shape", "Shape")
-    s = s.replace("original", "Orig")
-    s = s.replace("_", " · ")
+def format_widget_label(name: str, max_len: int = 150) -> str:
+    # No abbreviations. Only truncate if absurdly long to protect UI layout.
+    if len(name) > max_len:
+        return name[:max_len - 1] + "…"
+    return name
 
-    if len(s) > max_len:
-        s = s[:max_len - 1] + "…"
-    return s
-
-def format_force_label(name: str, max_len: int = 34) -> str:
-    s = name
-    s = s.replace("Venousperi_", "V-P ")
-    s = s.replace("Elasticityperi_", "E-P ")
-    s = s.replace("Venous_", "V ")
-    s = s.replace("Elasticity_", "E ")
-    s = s.replace("ResNet50Feat", "RN50")
-    s = s.replace("firstorder", "1st")
-    s = s.replace("wavelet", "Wav")
-    s = s.replace("log_sigma", "LoG")
-    s = s.replace("glszm", "GLSZM")
-    s = s.replace("glcm", "GLCM")
-    s = s.replace("gldm", "GLDM")
-    s = s.replace("ngtdm", "NGTDM")
-    s = s.replace("original", "Orig")
-    s = s.replace("3D", "")
-    s = s.replace("_", " · ")
-    s = " ".join(s.split())
-
-    if len(s) > max_len:
-        s = s[:max_len - 1] + "…"
-    return s
+def format_force_label(name: str, max_len: int = 150) -> str:
+    # No abbreviations for the force plot either.
+    if len(name) > max_len:
+        return name[:max_len - 1] + "…"
+    return name
 
 def safe_stats(series: pd.Series):
     s = pd.to_numeric(series, errors="coerce").dropna()
@@ -219,7 +180,7 @@ def subset_explanation(explanation, top_n=None, for_force=False):
     if for_force:
         display_names = [format_force_label(n) for n in names[order]]
     else:
-        display_names = [format_widget_label(n, max_len=44) for n in names[order]]
+        display_names = [format_widget_label(n) for n in names[order]]
 
     return shap.Explanation(
         values=values[order],
@@ -236,8 +197,7 @@ def build_shap_table(explanation):
     order = np.argsort(np.abs(values))[::-1]
 
     df = pd.DataFrame({
-        "Full Feature Name": names[order],
-        "Display Name": [format_widget_label(n, max_len=60) for n in names[order]],
+        "Feature Name": names[order],
         "Input Value": data[order],
         "SHAP Value": values[order],
         "Absolute SHAP": np.abs(values[order]),
@@ -262,6 +222,7 @@ def render_force_plot_html(explanation, height=280):
     with open(tmp_path, "r", encoding="utf-8") as f:
         html = f.read()
 
+    # Enable horizontal scrolling for the force plot since names are long
     html = html.replace(
         "<body>",
         '<body style="margin:0; background:#ffffff; overflow-x:auto; zoom:0.82;">'
@@ -276,13 +237,15 @@ def plot_waterfall(explanation, total_features):
         "figure.facecolor": "white", "axes.facecolor": "white"
     })
 
-    # 动态调整高度以适应所有特征
+    # Increased width to 16 to accommodate long feature names
     fig_height = max(7.2, total_features * 0.35)
-    fig = plt.figure(figsize=(11.5, fig_height), dpi=300)
+    fig = plt.figure(figsize=(16, fig_height), dpi=300)
     
     shap.plots.waterfall(explanation, max_display=total_features, show=False)
     fig = plt.gcf()
-    fig.subplots_adjust(left=0.37, right=0.97, top=0.98, bottom=0.05)
+    
+    # Dramatically increased left margin to 0.55 to push the plot right and leave space for names
+    fig.subplots_adjust(left=0.55, right=0.97, top=0.98, bottom=0.05)
 
     plt.rcParams.update(old_rc)
     return fig
@@ -295,9 +258,9 @@ def plot_top_contrib_bar(explanation, total_features):
     vals = values[order]
     labels = names[order]
 
-    # 动态调整高度
+    # Increased width to 15 to accommodate long feature names
     fig_height = max(6.2, total_features * 0.25)
-    fig, ax = plt.subplots(figsize=(10, fig_height), dpi=300)
+    fig, ax = plt.subplots(figsize=(15, fig_height), dpi=300)
     
     colors = ["#d9534f" if v > 0 else "#3b82f6" for v in vals]
     ax.barh(range(len(vals)), vals[::-1], color=colors[::-1], edgecolor="none")
@@ -310,6 +273,7 @@ def plot_top_contrib_bar(explanation, total_features):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
+    # tight_layout automatically calculates boundaries so long text stays visible
     plt.tight_layout()
     return fig
 
@@ -337,9 +301,9 @@ def plot_probability_bar(prob_pos):
 
 def make_input_widgets(feature_meta, feature_names):
     group_order = [
-        "Elasticity Features (弹性图特征)",
-        "Venous-phase CT Features (静脉期CT特征)",
-        "Other Features (其他特征)"
+        "Elasticity Features",
+        "Venous-phase CT Features",
+        "Other Features"
     ]
 
     grouped = {g: [] for g in group_order}
@@ -373,7 +337,7 @@ def make_input_widgets(feature_meta, feature_names):
 
                 with col:
                     user_values[feat] = st.number_input(
-                        label=format_widget_label(feat, max_len=52),
+                        label=format_widget_label(feat),
                         min_value=min_v, max_value=max_v, value=default_v,
                         help=help_text, format="%.6f", key=f"input_{feat}"
                     )
@@ -387,7 +351,7 @@ def make_interpretation_text(prob_pos, threshold):
         return f"The estimated probability of response is {prob_pos:.3f}, which is below the threshold ({threshold:.6f}). The model classifies this patient as a {NEGATIVE_LABEL_NAME}."
 
 # =========================================================
-# 5. 加载资源
+# 5. Load Assets
 # =========================================================
 check_required_files()
 model, x_train, y_train, feature_names, feature_meta, background = load_assets()
@@ -395,7 +359,7 @@ explainer = build_explainer(model, background)
 TOTAL_FEATURES = len(feature_names)
 
 # =========================================================
-# 6. 顶部信息
+# 6. Hero Section
 # =========================================================
 st.markdown(f"""
 <div class="hero-card">
@@ -412,7 +376,7 @@ st.markdown(f"""
 st.markdown(f'<div class="note-card">The deployment uses a fixed decision threshold of <b>{FIXED_THRESHOLD:.6f}</b>.</div>', unsafe_allow_html=True)
 
 # =========================================================
-# 7. 侧边栏
+# 7. Sidebar
 # =========================================================
 with st.sidebar:
     st.header("Model Overview")
@@ -424,7 +388,7 @@ with st.sidebar:
     st.caption("Research-use interface only. This tool does not replace clinical judgment.")
 
 # =========================================================
-# 8. 输入区
+# 8. Input Area
 # =========================================================
 st.subheader("Patient Feature Input")
 
@@ -445,7 +409,7 @@ if preview and not submitted:
         st.dataframe(input_df.T.rename(columns={0: "Value"}), use_container_width=True)
 
 # =========================================================
-# 9. 预测结果
+# 9. Results Area
 # =========================================================
 if submitted:
     positive_proba = float(predict_positive_proba(model, input_df)[0])
@@ -491,7 +455,7 @@ if submitted:
         render_force_plot_html(force_exp, height=290)
 
     with tab2:
-        st.caption(f"Waterfall plot and signed SHAP bar chart for all {TOTAL_FEATURES} features.")
+        st.caption(f"Waterfall plot and signed SHAP bar chart for all {TOTAL_FEATURES} features using original feature names.")
         fig1 = plot_waterfall(full_exp, total_features=TOTAL_FEATURES)
         st.pyplot(fig1, use_container_width=True)
 
@@ -506,7 +470,7 @@ if submitted:
         st.dataframe(display_df, use_container_width=True)
 
 # =========================================================
-# 10. 页脚
+# 10. Footer
 # =========================================================
 st.markdown("""
 <div class="footer-note">
