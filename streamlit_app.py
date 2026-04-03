@@ -1,5 +1,4 @@
 from pathlib import Path
-import re
 import textwrap
 
 import joblib
@@ -178,6 +177,7 @@ def safe_stats(series: pd.Series):
 @st.cache_resource(show_spinner=True)
 def load_assets():
     model = joblib.load(MODEL_PATH)
+
     x_train = pd.read_csv(X_TRAIN_PATH)
     x_train = clean_columns(x_train)
 
@@ -264,7 +264,8 @@ def build_shap_table(explanation):
 
 def break_feature_name(name: str, width: int = 42) -> str:
     name = str(name)
-    name = re.sub(r"([_.\\-])", r"\1\u200b", name)
+    for sep in ["_", ".", "-"]:
+        name = name.replace(sep, sep + "\u200b")
     wrapped = textwrap.fill(
         name,
         width=width,
@@ -518,7 +519,6 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
     ax.spines["bottom"].set_linewidth(1.0)
 
     ax.grid(False)
-
     fig.subplots_adjust(left=0.05, right=0.95, top=0.88, bottom=0.22)
 
     plt.rcParams.update(old_rc)
@@ -728,43 +728,64 @@ if submitted:
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.subheader("Model Explanation (SHAP)")
-    with st.spinner("Computing SHAP explanation..."):
-        explanation_full = shap_for_single_case(explainer, input_df, nsamples=SHAP_NSAMPLES)
-        force_exp = subset_explanation(
-            explanation_full,
-            top_n=min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)
-        )
-        full_exp = subset_explanation(
-            explanation_full,
-            top_n=TOTAL_FEATURES
-        )
-        shap_df = build_shap_table(explanation_full)
 
-    tab1, tab2, tab3 = st.tabs(["SHAP Guided Force Plot", "Waterfall Plot", "Features Table"])
+    explanation_ready = False
+    explanation_full = None
+    force_exp = None
+    full_exp = None
+    shap_df = None
 
-    with tab1:
-        st.caption(
-            f"Custom force-style SHAP plot with leader lines for long feature names "
-            f"(top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)} features by absolute SHAP value)."
-        )
-        fig_force = plot_guided_force_like(
-            explanation=force_exp,
-            prediction_value=positive_proba,
-            base_value=float(explanation_full.base_values)
-        )
-        st.pyplot(fig_force, use_container_width=True)
+    try:
+        with st.spinner("Computing SHAP explanation..."):
+            explanation_full = shap_for_single_case(explainer, input_df, nsamples=SHAP_NSAMPLES)
+            force_exp = subset_explanation(
+                explanation_full,
+                top_n=min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)
+            )
+            full_exp = subset_explanation(
+                explanation_full,
+                top_n=TOTAL_FEATURES
+            )
+            shap_df = build_shap_table(explanation_full)
+        explanation_ready = True
+    except Exception as e:
+        st.error(f"SHAP explanation failed: {e}")
 
-    with tab2:
-        st.caption("Waterfall plot using original feature names.")
-        fig1 = plot_waterfall(full_exp, total_features=TOTAL_FEATURES)
-        st.pyplot(fig1, use_container_width=True)
+    if explanation_ready:
+        tab1, tab2, tab3 = st.tabs(["SHAP Guided Force Plot", "Waterfall Plot", "Features Table"])
 
-    with tab3:
-        st.caption("Features ranked by absolute SHAP magnitude.")
-        display_df = shap_df.copy()
-        for col in ["Input Value", "SHAP Value", "Absolute SHAP"]:
-            display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
-        st.dataframe(display_df, use_container_width=True)
+        with tab1:
+            st.caption(
+                f"Custom force-style SHAP plot with leader lines for long feature names "
+                f"(top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)} features by absolute SHAP value)."
+            )
+            try:
+                fig_force = plot_guided_force_like(
+                    explanation=force_exp,
+                    prediction_value=positive_proba,
+                    base_value=float(explanation_full.base_values)
+                )
+                st.pyplot(fig_force, use_container_width=True)
+            except Exception as e:
+                st.error(f"SHAP guided force plot rendering failed: {e}")
+
+        with tab2:
+            st.caption("Waterfall plot using original feature names.")
+            try:
+                fig1 = plot_waterfall(full_exp, total_features=TOTAL_FEATURES)
+                st.pyplot(fig1, use_container_width=True)
+            except Exception as e:
+                st.error(f"SHAP waterfall plot rendering failed: {e}")
+
+        with tab3:
+            st.caption("Features ranked by absolute SHAP magnitude.")
+            try:
+                display_df = shap_df.copy()
+                for col in ["Input Value", "SHAP Value", "Absolute SHAP"]:
+                    display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+                st.dataframe(display_df, use_container_width=True)
+            except Exception as e:
+                st.error(f"SHAP feature table rendering failed: {e}")
 
 st.markdown("""
 <div class="footer-note">
