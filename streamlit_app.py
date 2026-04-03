@@ -35,7 +35,9 @@ NEGATIVE_LABEL_NAME = "Non-responder"
 
 SHAP_NSAMPLES = 160
 BACKGROUND_N = 30
-FORCE_MAX_DISPLAY = 16
+FORCE_MAX_DISPLAY = 12
+FORCE_LABEL_WIDTH = 34
+FORCE_MAX_ROWS_PER_COL = 5
 
 st.markdown("""
 <style>
@@ -152,10 +154,9 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 def infer_feature_group(feature_name: str) -> str:
     if "Elasticity" in feature_name:
         return "Elasticity Features"
-    elif "Venous" in feature_name:
+    if "Venous" in feature_name:
         return "Venous-phase CT Features"
-    else:
-        return "Other Features"
+    return "Other Features"
 
 def format_widget_label(name: str, max_len: int = 150) -> str:
     if len(name) > max_len:
@@ -220,13 +221,12 @@ def shap_for_single_case(explainer, input_df, nsamples=160):
     else:
         base_value = float(explainer.expected_value)
 
-    explanation = shap.Explanation(
+    return shap.Explanation(
         values=np.array(shap_values).reshape(-1),
         base_values=base_value,
         data=input_df.iloc[0].values,
         feature_names=input_df.columns.tolist()
     )
-    return explanation
 
 def subset_explanation(explanation, top_n=None):
     values = np.array(explanation.values)
@@ -252,7 +252,7 @@ def build_shap_table(explanation):
 
     order = np.argsort(np.abs(values))[::-1]
 
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "Feature Name": names[order],
         "Input Value": data[order],
         "SHAP Value": values[order],
@@ -260,19 +260,16 @@ def build_shap_table(explanation):
         "Direction": np.where(values[order] >= 0, "Increase response probability", "Decrease response probability")
     }).sort_values("Absolute SHAP", ascending=False)
 
-    return df
-
-def break_feature_name(name: str, width: int = 42) -> str:
+def break_feature_name(name: str, width: int = 34) -> str:
     name = str(name)
     for sep in ["_", ".", "-"]:
         name = name.replace(sep, sep + "\u200b")
-    wrapped = textwrap.fill(
+    return textwrap.fill(
         name,
         width=width,
         break_long_words=False,
         break_on_hyphens=False
     )
-    return wrapped
 
 def format_shap_value(v: float) -> str:
     sign = "+" if v >= 0 else ""
@@ -316,6 +313,71 @@ def draw_segment_patch(ax, x0, x1, y_center, height, color, arrow_size, directio
     )
     ax.add_patch(poly)
 
+def layout_side_labels(
+    segments,
+    side,
+    min_x,
+    max_x,
+    span,
+    max_rows_per_col=5,
+    label_width=34,
+    y_start=0.72
+):
+    if not segments:
+        return [], 0, y_start
+
+    def x_anchor(seg):
+        return (min(seg["x0"], seg["x1"]) + max(seg["x0"], seg["x1"])) / 2.0
+
+    if side == "right":
+        ordered = sorted(segments, key=x_anchor)
+    else:
+        ordered = sorted(segments, key=x_anchor, reverse=True)
+
+    cols = [
+        ordered[i:i + max_rows_per_col]
+        for i in range(0, len(ordered), max_rows_per_col)
+    ]
+
+    label_offset = max(0.08 * span, 0.10)
+    col_step = max(0.18 * span, 0.18)
+
+    if side == "right":
+        x_base = max_x + label_offset
+    else:
+        x_base = min_x - label_offset
+
+    laid_out = []
+    max_y_used = y_start
+
+    for col_idx, col_segments in enumerate(cols):
+        if side == "right":
+            x_text = x_base + col_idx * col_step
+            ha = "left"
+        else:
+            x_text = x_base - col_idx * col_step
+            ha = "right"
+
+        y_cursor = y_start
+
+        for seg in col_segments:
+            label_text = f"[{seg['display_no']}] " + break_feature_name(seg["name"], width=label_width)
+            n_lines = label_text.count("\n") + 1
+            row_height = max(0.11, 0.06 + (n_lines - 1) * 0.055)
+
+            laid_out.append({
+                **seg,
+                "label_text": label_text,
+                "x_text": x_text,
+                "y_text": y_cursor,
+                "ha": ha
+            })
+
+            max_y_used = max(max_y_used, y_cursor)
+            y_cursor += row_height
+
+    return laid_out, len(cols), max_y_used
+
 def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
     values = np.array(explanation.values, dtype=float)
     names = np.array(explanation.feature_names, dtype=object)
@@ -330,39 +392,47 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
     else:
         prediction_value = float(prediction_value)
 
-    pos_idx = np.where(values >= 0)[0]
-    neg_idx = np.where(values < 0)[0]
+    item_info = []
+    for i, (name, value) in enumerate(zip(names, values), start=1):
+        item_info.append({
+            "name": str(name),
+            "value": float(value),
+            "display_no": i
+        })
 
-    pos_idx = pos_idx[np.argsort(np.abs(values[pos_idx]))[::-1]]
-    neg_idx = neg_idx[np.argsort(np.abs(values[neg_idx]))[::-1]]
+    pos_items = [x for x in item_info if x["value"] >= 0]
+    neg_items = [x for x in item_info if x["value"] < 0]
+
+    pos_items = sorted(pos_items, key=lambda x: abs(x["value"]), reverse=True)
+    neg_items = sorted(neg_items, key=lambda x: abs(x["value"]), reverse=True)
 
     neg_segments = []
     current_left = base_value
-    for rank, idx in enumerate(neg_idx):
-        v = float(values[idx])
+    for item in neg_items:
+        v = item["value"]
         x0 = current_left + v
         x1 = current_left
         neg_segments.append({
-            "name": str(names[idx]),
+            "name": item["name"],
             "value": v,
             "x0": x0,
             "x1": x1,
-            "rank": rank
+            "display_no": item["display_no"]
         })
         current_left = x0
 
     pos_segments = []
     current_right = base_value
-    for rank, idx in enumerate(pos_idx):
-        v = float(values[idx])
+    for item in pos_items:
+        v = item["value"]
         x0 = current_right
         x1 = current_right + v
         pos_segments.append({
-            "name": str(names[idx]),
+            "name": item["name"],
             "value": v,
             "x0": x0,
             "x1": x1,
-            "rank": rank
+            "display_no": item["display_no"]
         })
         current_right = x1
 
@@ -374,12 +444,38 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
     max_x = max(xs)
     span = max(max_x - min_x, 1e-6)
 
-    x_margin = max(0.18 * span, 0.35)
-    arrow_size = max(0.018 * span, 0.015)
-    value_text_threshold = max(0.055 * span, 0.08)
+    left_labels, left_cols, left_max_y = layout_side_labels(
+        neg_segments,
+        side="left",
+        min_x=min_x,
+        max_x=max_x,
+        span=span,
+        max_rows_per_col=FORCE_MAX_ROWS_PER_COL,
+        label_width=FORCE_LABEL_WIDTH,
+        y_start=0.72
+    )
 
-    n_rows = max(len(pos_segments), len(neg_segments), 1)
-    fig_height = min(max(4.8 + 0.20 * min(n_rows, 8), 5.4), 8.2)
+    right_labels, right_cols, right_max_y = layout_side_labels(
+        pos_segments,
+        side="right",
+        min_x=min_x,
+        max_x=max_x,
+        span=span,
+        max_rows_per_col=FORCE_MAX_ROWS_PER_COL,
+        label_width=FORCE_LABEL_WIDTH,
+        y_start=0.72
+    )
+
+    col_step = max(0.18 * span, 0.18)
+    side_pad = max(0.12 * span, 0.18)
+
+    left_margin = side_pad + max(0, left_cols - 1) * col_step + 0.22 * span
+    right_margin = side_pad + max(0, right_cols - 1) * col_step + 0.22 * span
+
+    y_top = max(left_max_y, right_max_y) + 0.22
+
+    n_label_items = max(len(left_labels), len(right_labels), 1)
+    fig_height = min(max(5.8, 4.8 + 0.18 * n_label_items), 9.2)
 
     plt.close("all")
     old_rc = plt.rcParams.copy()
@@ -390,14 +486,18 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
         "axes.unicode_minus": False
     })
 
-    fig, ax = plt.subplots(figsize=(16, fig_height), dpi=300)
+    fig, ax = plt.subplots(figsize=(17, fig_height), dpi=300)
+
     bar_y = 0.0
     bar_h = 0.34
 
     neg_color = "#F2C94C"
     pos_color = "#B73779"
-    line_color = "#8B93A1"
+    line_color = "#9AA3AF"
     text_color = "#2E3440"
+
+    arrow_size = max(0.018 * span, 0.015)
+    num_text_threshold = max(0.040 * span, 0.055)
 
     for seg in neg_segments:
         draw_segment_patch(
@@ -425,52 +525,51 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
 
     for seg in neg_segments + pos_segments:
         width = abs(seg["x1"] - seg["x0"])
-        if width >= value_text_threshold:
+        xc = (seg["x0"] + seg["x1"]) / 2.0
+
+        if width >= num_text_threshold:
             ax.text(
-                (seg["x0"] + seg["x1"]) / 2.0,
+                xc,
                 bar_y,
-                format_shap_value(seg["value"]),
+                str(seg["display_no"]),
                 ha="center",
                 va="center",
-                fontsize=8.2,
-                color="#2F2F2F",
+                fontsize=8.1,
+                color="white" if seg["value"] > 0 else "#3A3A3A",
+                fontweight="bold"
+            )
+        else:
+            ax.text(
+                xc,
+                bar_y + bar_h / 2 + 0.05,
+                str(seg["display_no"]),
+                ha="center",
+                va="bottom",
+                fontsize=6.7,
+                color="#4B5563",
                 fontweight="bold"
             )
 
-    def add_label(seg, side="left"):
-        x_left = min(seg["x0"], seg["x1"])
-        x_right = max(seg["x0"], seg["x1"])
+    def draw_label_item(item):
+        x_left = min(item["x0"], item["x1"])
+        x_right = max(item["x0"], item["x1"])
         x_anchor = (x_left + x_right) / 2.0
         y_anchor = bar_y + bar_h / 2.0
-
-        rank = seg["rank"]
-        row = rank % 5
-        layer = rank // 5
-
-        y_text = 0.72 + row * 0.11 + layer * 0.05
-
-        if side == "left":
-            x_text = x_left - (0.05 * span) - (0.018 * span) * (rank % 4)
-            ha = "right"
-        else:
-            x_text = x_right + (0.05 * span) + (0.018 * span) * (rank % 4)
-            ha = "left"
-
-        y_mid = y_text - 0.04
+        y_knee = item["y_text"] - 0.035
 
         ax.plot(
-            [x_anchor, x_anchor, x_text],
-            [y_anchor, y_mid, y_mid],
+            [x_anchor, x_anchor, item["x_text"]],
+            [y_anchor, y_knee, y_knee],
             color=line_color,
             linewidth=0.8,
             solid_capstyle="round"
         )
 
         ax.text(
-            x_text,
-            y_text,
-            break_feature_name(seg["name"], width=42),
-            ha=ha,
+            item["x_text"],
+            item["y_text"],
+            item["label_text"],
+            ha=item["ha"],
             va="bottom",
             fontsize=7.8,
             color=text_color,
@@ -478,11 +577,11 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
             clip_on=False
         )
 
-    for seg in neg_segments:
-        add_label(seg, side="left")
+    for item in left_labels:
+        draw_label_item(item)
 
-    for seg in pos_segments:
-        add_label(seg, side="right")
+    for item in right_labels:
+        draw_label_item(item)
 
     ax.axvline(base_value, color="#9AA0AA", linestyle=(0, (3, 3)), linewidth=1.0, zorder=0)
     ax.text(
@@ -506,8 +605,8 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
         color="#444444"
     )
 
-    ax.set_xlim(min_x - x_margin, max_x + x_margin)
-    ax.set_ylim(-0.62, 1.38)
+    ax.set_xlim(min_x - left_margin, max_x + right_margin)
+    ax.set_ylim(-0.62, y_top)
     ax.set_yticks([])
     ax.set_xlabel("SHAP value", fontsize=10)
     ax.tick_params(axis="x", labelsize=9)
@@ -517,9 +616,9 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
     ax.spines["top"].set_visible(False)
     ax.spines["bottom"].set_color("#AAB2BF")
     ax.spines["bottom"].set_linewidth(1.0)
-
     ax.grid(False)
-    fig.subplots_adjust(left=0.05, right=0.95, top=0.88, bottom=0.22)
+
+    fig.subplots_adjust(left=0.05, right=0.95, top=0.92, bottom=0.20)
 
     plt.rcParams.update(old_rc)
     return fig
@@ -628,12 +727,11 @@ def make_interpretation_text(prob_pos, threshold):
             f"which is above the threshold ({threshold:.6f}). "
             f"The model classifies this patient as a {POSITIVE_LABEL_NAME}."
         )
-    else:
-        return (
-            f"The estimated probability of response is {prob_pos:.3f}, "
-            f"which is below the threshold ({threshold:.6f}). "
-            f"The model classifies this patient as a {NEGATIVE_LABEL_NAME}."
-        )
+    return (
+        f"The estimated probability of response is {prob_pos:.3f}, "
+        f"which is below the threshold ({threshold:.6f}). "
+        f"The model classifies this patient as a {NEGATIVE_LABEL_NAME}."
+    )
 
 check_required_files()
 model, x_train, y_train, feature_names, feature_meta, background = load_assets()
@@ -756,7 +854,7 @@ if submitted:
 
         with tab1:
             st.caption(
-                f"Custom force-style SHAP plot with leader lines for long feature names "
+                f"Custom force-style SHAP plot with leader lines and indexed labels "
                 f"(top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)} features by absolute SHAP value)."
             )
             try:
