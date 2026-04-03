@@ -1,6 +1,6 @@
-import os
-import tempfile
 from pathlib import Path
+import re
+import textwrap
 
 import joblib
 import shap
@@ -8,11 +8,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-import streamlit.components.v1 as components
+from matplotlib.patches import Polygon
 
-# =========================================================
-# 1. Page Configuration
-# =========================================================
 st.set_page_config(
     page_title="UAGC Immunochemotherapy Response Predictor",
     page_icon="🧬",
@@ -20,9 +17,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# =========================================================
-# 2. File Paths & Constants
-# =========================================================
 APP_DIR = Path(__file__).resolve().parent
 
 MODEL_PATH = APP_DIR / "SVM_rbf.pkl"
@@ -42,34 +36,105 @@ NEGATIVE_LABEL_NAME = "Non-responder"
 
 SHAP_NSAMPLES = 160
 BACKGROUND_N = 30
+FORCE_MAX_DISPLAY = 16
 
-# =========================================================
-# 3. CSS Styling
-# =========================================================
 st.markdown("""
 <style>
     .main { background: linear-gradient(180deg, #f7f9fc 0%, #f4f7fb 100%); }
     .block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1500px; }
     h1, h2, h3 { color: #1f2d3d; font-family: "Times New Roman", serif; letter-spacing: 0.2px; }
-    .hero-card { background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%); border: 1px solid #e6edf6; border-radius: 22px; padding: 1.35rem 1.6rem; box-shadow: 0 8px 24px rgba(31,45,61,0.08); margin-bottom: 1rem; }
-    .note-card { background: #f4f8fc; border-left: 5px solid #4a90e2; border-radius: 12px; padding: 0.95rem 1rem; color: #30465d; font-size: 0.96rem; margin-bottom: 1rem; }
-    .metric-card { background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%); border: 1px solid #dfe8f4; border-radius: 18px; padding: 1rem 1.15rem; box-shadow: 0 4px 14px rgba(31,45,61,0.06); text-align: center; min-height: 132px; }
-    .metric-title { font-size: 0.92rem; color: #607387; margin-bottom: 0.2rem; }
-    .metric-value { font-size: 1.75rem; font-weight: 700; color: #163a63; line-height: 1.2; }
-    .metric-sub { font-size: 0.86rem; color: #7d8c9c; margin-top: 0.3rem; }
-    .result-positive { background: linear-gradient(135deg, #eef9f1 0%, #ffffff 100%); border: 1px solid #b9e5c4; border-radius: 14px; padding: 1rem 1.2rem; color: #1f5d2e; font-weight: 600; margin-top: 0.75rem; }
-    .result-negative { background: linear-gradient(135deg, #fff4f4 0%, #ffffff 100%); border: 1px solid #f0c3c3; border-radius: 14px; padding: 1rem 1.2rem; color: #8a2d2d; font-weight: 600; margin-top: 0.75rem; }
-    .section-card { background: white; border: 1px solid #e7edf5; border-radius: 18px; padding: 1rem 1rem 0.6rem 1rem; box-shadow: 0 4px 14px rgba(31,45,61,0.05); margin-bottom: 1rem; }
-    .footer-note { font-size: 0.82rem; color: #708090; margin-top: 1rem; }
-    .small-muted { color: #6d7d8d; font-size: 0.88rem; }
-    div[data-testid="stExpander"] { border-radius: 14px !important; border: 1px solid #e6edf5 !important; background: #ffffff !important; }
-    div[data-testid="stForm"] { background: white; border: 1px solid #e7edf5; border-radius: 18px; padding: 1rem 1rem 0.2rem 1rem; box-shadow: 0 4px 14px rgba(31,45,61,0.05); }
+    .hero-card {
+        background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
+        border: 1px solid #e6edf6;
+        border-radius: 22px;
+        padding: 1.35rem 1.6rem;
+        box-shadow: 0 8px 24px rgba(31,45,61,0.08);
+        margin-bottom: 1rem;
+    }
+    .note-card {
+        background: #f4f8fc;
+        border-left: 5px solid #4a90e2;
+        border-radius: 12px;
+        padding: 0.95rem 1rem;
+        color: #30465d;
+        font-size: 0.96rem;
+        margin-bottom: 1rem;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
+        border: 1px solid #dfe8f4;
+        border-radius: 18px;
+        padding: 1rem 1.15rem;
+        box-shadow: 0 4px 14px rgba(31,45,61,0.06);
+        text-align: center;
+        min-height: 132px;
+    }
+    .metric-title {
+        font-size: 0.92rem;
+        color: #607387;
+        margin-bottom: 0.2rem;
+    }
+    .metric-value {
+        font-size: 1.75rem;
+        font-weight: 700;
+        color: #163a63;
+        line-height: 1.2;
+    }
+    .metric-sub {
+        font-size: 0.86rem;
+        color: #7d8c9c;
+        margin-top: 0.3rem;
+    }
+    .result-positive {
+        background: linear-gradient(135deg, #eef9f1 0%, #ffffff 100%);
+        border: 1px solid #b9e5c4;
+        border-radius: 14px;
+        padding: 1rem 1.2rem;
+        color: #1f5d2e;
+        font-weight: 600;
+        margin-top: 0.75rem;
+    }
+    .result-negative {
+        background: linear-gradient(135deg, #fff4f4 0%, #ffffff 100%);
+        border: 1px solid #f0c3c3;
+        border-radius: 14px;
+        padding: 1rem 1.2rem;
+        color: #8a2d2d;
+        font-weight: 600;
+        margin-top: 0.75rem;
+    }
+    .section-card {
+        background: white;
+        border: 1px solid #e7edf5;
+        border-radius: 18px;
+        padding: 1rem 1rem 0.6rem 1rem;
+        box-shadow: 0 4px 14px rgba(31,45,61,0.05);
+        margin-bottom: 1rem;
+    }
+    .footer-note {
+        font-size: 0.82rem;
+        color: #708090;
+        margin-top: 1rem;
+    }
+    .small-muted {
+        color: #6d7d8d;
+        font-size: 0.88rem;
+    }
+    div[data-testid="stExpander"] {
+        border-radius: 14px !important;
+        border: 1px solid #e6edf5 !important;
+        background: #ffffff !important;
+    }
+    div[data-testid="stForm"] {
+        background: white;
+        border: 1px solid #e7edf5;
+        border-radius: 18px;
+        padding: 1rem 1rem 0.2rem 1rem;
+        box-shadow: 0 4px 14px rgba(31,45,61,0.05);
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# =========================================================
-# 4. Utility Functions
-# =========================================================
 def check_required_files():
     required = [MODEL_PATH, X_TRAIN_PATH, Y_TRAIN_PATH]
     missing = [p.name for p in required if not p.exists()]
@@ -94,13 +159,6 @@ def infer_feature_group(feature_name: str) -> str:
         return "Other Features"
 
 def format_widget_label(name: str, max_len: int = 150) -> str:
-    # No abbreviations. Only truncate if absurdly long to protect UI layout.
-    if len(name) > max_len:
-        return name[:max_len - 1] + "…"
-    return name
-
-def format_force_label(name: str, max_len: int = 150) -> str:
-    # No abbreviations for the force plot either.
     if len(name) > max_len:
         return name[:max_len - 1] + "…"
     return name
@@ -157,7 +215,10 @@ def shap_for_single_case(explainer, input_df, nsamples=160):
     if isinstance(shap_values, list):
         shap_values = shap_values[0]
 
-    base_value = float(np.array(explainer.expected_value).reshape(-1)[0]) if isinstance(explainer.expected_value, (list, np.ndarray)) else float(explainer.expected_value)
+    if isinstance(explainer.expected_value, (list, np.ndarray)):
+        base_value = float(np.array(explainer.expected_value).reshape(-1)[0])
+    else:
+        base_value = float(explainer.expected_value)
 
     explanation = shap.Explanation(
         values=np.array(shap_values).reshape(-1),
@@ -167,26 +228,21 @@ def shap_for_single_case(explainer, input_df, nsamples=160):
     )
     return explanation
 
-def subset_explanation(explanation, top_n=None, for_force=False):
+def subset_explanation(explanation, top_n=None):
     values = np.array(explanation.values)
     names = np.array(explanation.feature_names)
     data = np.array(explanation.data)
 
     if top_n is None:
         top_n = len(values)
-        
-    order = np.argsort(np.abs(values))[::-1][:top_n]
 
-    if for_force:
-        display_names = [format_force_label(n) for n in names[order]]
-    else:
-        display_names = [format_widget_label(n) for n in names[order]]
+    order = np.argsort(np.abs(values))[::-1][:top_n]
 
     return shap.Explanation(
         values=values[order],
         base_values=float(explanation.base_values),
         data=data[order],
-        feature_names=display_names
+        feature_names=names[order].tolist()
     )
 
 def build_shap_table(explanation):
@@ -206,45 +262,285 @@ def build_shap_table(explanation):
 
     return df
 
-def render_force_plot_html(explanation, height=280):
-    feature_values = pd.Series(explanation.data, index=explanation.feature_names)
-    force_obj = shap.force_plot(
-        base_value=float(explanation.base_values),
-        shap_values=np.array(explanation.values),
-        features=feature_values,
-        matplotlib=False
+def break_feature_name(name: str, width: int = 42) -> str:
+    name = str(name)
+    name = re.sub(r"([_.\\-])", r"\1\u200b", name)
+    wrapped = textwrap.fill(
+        name,
+        width=width,
+        break_long_words=False,
+        break_on_hyphens=False
+    )
+    return wrapped
+
+def format_shap_value(v: float) -> str:
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:.3f}"
+
+def draw_segment_patch(ax, x0, x1, y_center, height, color, arrow_size, direction="right"):
+    if x1 < x0:
+        x0, x1 = x1, x0
+
+    width = x1 - x0
+    arrow = min(arrow_size, width * 0.45) if width > 0 else arrow_size
+    y0 = y_center - height / 2.0
+    y1 = y_center + height / 2.0
+
+    if direction == "right":
+        pts = [
+            (x0, y0),
+            (x1 - arrow, y0),
+            (x1, y_center),
+            (x1 - arrow, y1),
+            (x0, y1),
+            (x0 + arrow, y_center)
+        ]
+    else:
+        pts = [
+            (x0 + arrow, y0),
+            (x1, y0),
+            (x1 - arrow, y_center),
+            (x1, y1),
+            (x0 + arrow, y1),
+            (x0, y_center)
+        ]
+
+    poly = Polygon(
+        pts,
+        closed=True,
+        facecolor=color,
+        edgecolor="white",
+        linewidth=1.0,
+        joinstyle="round"
+    )
+    ax.add_patch(poly)
+
+def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
+    values = np.array(explanation.values, dtype=float)
+    names = np.array(explanation.feature_names, dtype=object)
+
+    if base_value is None:
+        base_value = float(explanation.base_values)
+    else:
+        base_value = float(base_value)
+
+    if prediction_value is None:
+        prediction_value = base_value + float(np.sum(values))
+    else:
+        prediction_value = float(prediction_value)
+
+    pos_idx = np.where(values >= 0)[0]
+    neg_idx = np.where(values < 0)[0]
+
+    pos_idx = pos_idx[np.argsort(np.abs(values[pos_idx]))[::-1]]
+    neg_idx = neg_idx[np.argsort(np.abs(values[neg_idx]))[::-1]]
+
+    neg_segments = []
+    current_left = base_value
+    for rank, idx in enumerate(neg_idx):
+        v = float(values[idx])
+        x0 = current_left + v
+        x1 = current_left
+        neg_segments.append({
+            "name": str(names[idx]),
+            "value": v,
+            "x0": x0,
+            "x1": x1,
+            "rank": rank
+        })
+        current_left = x0
+
+    pos_segments = []
+    current_right = base_value
+    for rank, idx in enumerate(pos_idx):
+        v = float(values[idx])
+        x0 = current_right
+        x1 = current_right + v
+        pos_segments.append({
+            "name": str(names[idx]),
+            "value": v,
+            "x0": x0,
+            "x1": x1,
+            "rank": rank
+        })
+        current_right = x1
+
+    xs = [base_value, prediction_value]
+    for s in neg_segments + pos_segments:
+        xs.extend([s["x0"], s["x1"]])
+
+    min_x = min(xs)
+    max_x = max(xs)
+    span = max(max_x - min_x, 1e-6)
+
+    x_margin = max(0.18 * span, 0.35)
+    arrow_size = max(0.018 * span, 0.015)
+    value_text_threshold = max(0.055 * span, 0.08)
+
+    n_rows = max(len(pos_segments), len(neg_segments), 1)
+    fig_height = min(max(4.8 + 0.20 * min(n_rows, 8), 5.4), 8.2)
+
+    plt.close("all")
+    old_rc = plt.rcParams.copy()
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Arial", "DejaVu Serif"],
+        "font.size": 9,
+        "axes.unicode_minus": False
+    })
+
+    fig, ax = plt.subplots(figsize=(16, fig_height), dpi=300)
+    bar_y = 0.0
+    bar_h = 0.34
+
+    neg_color = "#F2C94C"
+    pos_color = "#B73779"
+    line_color = "#8B93A1"
+    text_color = "#2E3440"
+
+    for seg in neg_segments:
+        draw_segment_patch(
+            ax=ax,
+            x0=seg["x0"],
+            x1=seg["x1"],
+            y_center=bar_y,
+            height=bar_h,
+            color=neg_color,
+            arrow_size=arrow_size,
+            direction="left"
+        )
+
+    for seg in pos_segments:
+        draw_segment_patch(
+            ax=ax,
+            x0=seg["x0"],
+            x1=seg["x1"],
+            y_center=bar_y,
+            height=bar_h,
+            color=pos_color,
+            arrow_size=arrow_size,
+            direction="right"
+        )
+
+    for seg in neg_segments + pos_segments:
+        width = abs(seg["x1"] - seg["x0"])
+        if width >= value_text_threshold:
+            ax.text(
+                (seg["x0"] + seg["x1"]) / 2.0,
+                bar_y,
+                format_shap_value(seg["value"]),
+                ha="center",
+                va="center",
+                fontsize=8.2,
+                color="#2F2F2F",
+                fontweight="bold"
+            )
+
+    def add_label(seg, side="left"):
+        x_left = min(seg["x0"], seg["x1"])
+        x_right = max(seg["x0"], seg["x1"])
+        x_anchor = (x_left + x_right) / 2.0
+        y_anchor = bar_y + bar_h / 2.0
+
+        rank = seg["rank"]
+        row = rank % 5
+        layer = rank // 5
+
+        y_text = 0.72 + row * 0.11 + layer * 0.05
+
+        if side == "left":
+            x_text = x_left - (0.05 * span) - (0.018 * span) * (rank % 4)
+            ha = "right"
+        else:
+            x_text = x_right + (0.05 * span) + (0.018 * span) * (rank % 4)
+            ha = "left"
+
+        y_mid = y_text - 0.04
+
+        ax.plot(
+            [x_anchor, x_anchor, x_text],
+            [y_anchor, y_mid, y_mid],
+            color=line_color,
+            linewidth=0.8,
+            solid_capstyle="round"
+        )
+
+        ax.text(
+            x_text,
+            y_text,
+            break_feature_name(seg["name"], width=42),
+            ha=ha,
+            va="bottom",
+            fontsize=7.8,
+            color=text_color,
+            linespacing=1.05,
+            clip_on=False
+        )
+
+    for seg in neg_segments:
+        add_label(seg, side="left")
+
+    for seg in pos_segments:
+        add_label(seg, side="right")
+
+    ax.axvline(base_value, color="#9AA0AA", linestyle=(0, (3, 3)), linewidth=1.0, zorder=0)
+    ax.text(
+        base_value,
+        -0.46,
+        "base value",
+        ha="center",
+        va="top",
+        fontsize=8.5,
+        color="#6B7280"
     )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
-        shap.save_html(tmp.name, force_obj)
-        tmp_path = tmp.name
-
-    with open(tmp_path, "r", encoding="utf-8") as f:
-        html = f.read()
-
-    # Enable horizontal scrolling for the force plot since names are long
-    html = html.replace(
-        "<body>",
-        '<body style="margin:0; background:#ffffff; overflow-x:auto; zoom:0.82;">'
+    ax.axvline(prediction_value, color="#7A7A7A", linestyle=(0, (3, 3)), linewidth=1.0, zorder=0)
+    ax.text(
+        prediction_value,
+        0.16,
+        f"f(x) = {prediction_value:.3f}",
+        ha="center",
+        va="bottom",
+        fontsize=8.8,
+        color="#444444"
     )
-    components.html(html, height=height, scrolling=True)
+
+    ax.set_xlim(min_x - x_margin, max_x + x_margin)
+    ax.set_ylim(-0.62, 1.38)
+    ax.set_yticks([])
+    ax.set_xlabel("SHAP value", fontsize=10)
+    ax.tick_params(axis="x", labelsize=9)
+
+    ax.spines["left"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["bottom"].set_color("#AAB2BF")
+    ax.spines["bottom"].set_linewidth(1.0)
+
+    ax.grid(False)
+
+    fig.subplots_adjust(left=0.05, right=0.95, top=0.88, bottom=0.22)
+
+    plt.rcParams.update(old_rc)
+    return fig
 
 def plot_waterfall(explanation, total_features):
     plt.close("all")
     old_rc = plt.rcParams.copy()
     plt.rcParams.update({
-        "font.size": 10, "axes.titlesize": 12, "axes.labelsize": 10,
-        "figure.facecolor": "white", "axes.facecolor": "white"
+        "font.size": 10,
+        "axes.titlesize": 12,
+        "axes.labelsize": 10,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Arial", "DejaVu Serif"]
     })
 
-    # Increased width to 16 to accommodate long feature names
     fig_height = max(7.2, total_features * 0.35)
-    fig = plt.figure(figsize=(16, fig_height), dpi=300)
-    
+    plt.figure(figsize=(16, fig_height), dpi=300)
     shap.plots.waterfall(explanation, max_display=total_features, show=False)
     fig = plt.gcf()
-    
-    # Dramatically increased left margin to 0.55 to push the plot right and leave space for names
     fig.subplots_adjust(left=0.55, right=0.97, top=0.98, bottom=0.05)
 
     plt.rcParams.update(old_rc)
@@ -265,7 +561,15 @@ def plot_probability_bar(prob_pos):
 
     for bar, val in zip(bars, probs):
         x = min(val + 0.015, 0.96)
-        ax.text(x, bar.get_y() + bar.get_height()/2, f"{val:.3f}", va="center", ha="left", fontsize=10, fontweight="bold")
+        ax.text(
+            x,
+            bar.get_y() + bar.get_height() / 2,
+            f"{val:.3f}",
+            va="center",
+            ha="left",
+            fontsize=10,
+            fontweight="bold"
+        )
 
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -298,42 +602,44 @@ def make_input_widgets(feature_meta, feature_names):
                 meta = feature_meta[feat]
                 col = cols[idx % 3]
 
-                min_v = float(meta["min"])
-                max_v = float(meta["max"])
                 default_v = float(meta["median"])
-
-                if min_v == max_v:
-                    min_v -= 1e-6
-                    max_v += 1e-6
-
-                help_text = (f"Full name: {feat}\nRange: {meta['min']:.4f} to {meta['max']:.4f}\nMedian: {meta['median']:.4f}")
+                help_text = (
+                    f"Full name: {feat}\n"
+                    f"Reference median: {meta['median']:.4f}\n"
+                    f"Reference Q1: {meta['q1']:.4f}\n"
+                    f"Reference Q3: {meta['q3']:.4f}"
+                )
 
                 with col:
                     user_values[feat] = st.number_input(
                         label=format_widget_label(feat),
-                        min_value=min_v, max_value=max_v, value=default_v,
-                        help=help_text, format="%.6f", key=f"input_{feat}"
+                        value=default_v,
+                        help=help_text,
+                        format="%.6f",
+                        key=f"input_{feat}"
                     )
 
     return user_values
 
 def make_interpretation_text(prob_pos, threshold):
     if prob_pos >= threshold:
-        return f"The estimated probability of response is {prob_pos:.3f}, which is above the threshold ({threshold:.6f}). The model classifies this patient as a {POSITIVE_LABEL_NAME}."
+        return (
+            f"The estimated probability of response is {prob_pos:.3f}, "
+            f"which is above the threshold ({threshold:.6f}). "
+            f"The model classifies this patient as a {POSITIVE_LABEL_NAME}."
+        )
     else:
-        return f"The estimated probability of response is {prob_pos:.3f}, which is below the threshold ({threshold:.6f}). The model classifies this patient as a {NEGATIVE_LABEL_NAME}."
+        return (
+            f"The estimated probability of response is {prob_pos:.3f}, "
+            f"which is below the threshold ({threshold:.6f}). "
+            f"The model classifies this patient as a {NEGATIVE_LABEL_NAME}."
+        )
 
-# =========================================================
-# 5. Load Assets
-# =========================================================
 check_required_files()
 model, x_train, y_train, feature_names, feature_meta, background = load_assets()
 explainer = build_explainer(model, background)
 TOTAL_FEATURES = len(feature_names)
 
-# =========================================================
-# 6. Hero Section
-# =========================================================
 st.markdown(f"""
 <div class="hero-card">
     <h1 style="margin-bottom:0.35rem;">{APP_TITLE}</h1>
@@ -346,27 +652,28 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown(f'<div class="note-card">The deployment uses a fixed decision threshold of <b>{FIXED_THRESHOLD:.6f}</b>.</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="note-card">The deployment uses a fixed decision threshold of <b>{FIXED_THRESHOLD:.6f}</b>.</div>',
+    unsafe_allow_html=True
+)
 
-# =========================================================
-# 7. Sidebar
-# =========================================================
 with st.sidebar:
     st.header("Model Overview")
     st.write(f"**Model:** {MODEL_ALIAS}")
     st.write(f"**Classifier:** {TARGET_MODEL_NAME}")
     st.write(f"**Total Features:** {TOTAL_FEATURES}")
     st.write(f"**Decision threshold:** {FIXED_THRESHOLD:.6f}")
+    st.write(f"**Force plot features:** Top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)}")
     st.markdown("---")
     st.caption("Research-use interface only. This tool does not replace clinical judgment.")
 
-# =========================================================
-# 8. Input Area
-# =========================================================
 st.subheader("Patient Feature Input")
 
 with st.form("prediction_form", clear_on_submit=False):
-    st.markdown('<div class="small-muted">Enter patient-specific radiomics feature values below. Features are grouped into Elasticity and Venous-phase CT.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="small-muted">Enter patient-specific radiomics feature values below. Features are grouped into Elasticity and Venous-phase CT.</div>',
+        unsafe_allow_html=True
+    )
     user_inputs = make_input_widgets(feature_meta, feature_names)
 
     c1, c2, c3 = st.columns([1.2, 1.2, 3.6])
@@ -381,9 +688,6 @@ if preview and not submitted:
     with st.expander("Current Input Table", expanded=True):
         st.dataframe(input_df.T.rename(columns={0: "Value"}), use_container_width=True)
 
-# =========================================================
-# 9. Results Area
-# =========================================================
 if submitted:
     positive_proba = float(predict_positive_proba(model, input_df)[0])
     negative_proba = 1 - positive_proba
@@ -394,11 +698,20 @@ if submitted:
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Response Probability</div><div class="metric-value">{positive_proba * 100:.1f}%</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Response Probability</div><div class="metric-value">{positive_proba * 100:.1f}%</div></div>',
+            unsafe_allow_html=True
+        )
     with c2:
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Predicted Category</div><div class="metric-value" style="font-size:1.18rem;">{predicted_label}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Predicted Category</div><div class="metric-value" style="font-size:1.18rem;">{predicted_label}</div></div>',
+            unsafe_allow_html=True
+        )
     with c3:
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Non-response Probability</div><div class="metric-value">{negative_proba * 100:.1f}%</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Non-response Probability</div><div class="metric-value">{negative_proba * 100:.1f}%</div></div>',
+            unsafe_allow_html=True
+        )
 
     st.progress(int(round(positive_proba * 100)))
 
@@ -417,33 +730,44 @@ if submitted:
     st.subheader("Model Explanation (SHAP)")
     with st.spinner("Computing SHAP explanation..."):
         explanation_full = shap_for_single_case(explainer, input_df, nsamples=SHAP_NSAMPLES)
-        force_exp = subset_explanation(explanation_full, top_n=TOTAL_FEATURES, for_force=True)
-        full_exp = subset_explanation(explanation_full, top_n=TOTAL_FEATURES, for_force=False)
+        force_exp = subset_explanation(
+            explanation_full,
+            top_n=min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)
+        )
+        full_exp = subset_explanation(
+            explanation_full,
+            top_n=TOTAL_FEATURES
+        )
         shap_df = build_shap_table(explanation_full)
 
-    tab1, tab2, tab3 = st.tabs(["SHAP Force Plot", "Waterfall Plot", "Features Table"])
+    tab1, tab2, tab3 = st.tabs(["SHAP Guided Force Plot", "Waterfall Plot", "Features Table"])
 
     with tab1:
-        st.caption(f"Interactive force plot for the features.")
-        render_force_plot_html(force_exp, height=290)
+        st.caption(
+            f"Custom force-style SHAP plot with leader lines for long feature names "
+            f"(top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)} features by absolute SHAP value)."
+        )
+        fig_force = plot_guided_force_like(
+            explanation=force_exp,
+            prediction_value=positive_proba,
+            base_value=float(explanation_full.base_values)
+        )
+        st.pyplot(fig_force, use_container_width=True)
 
     with tab2:
-        st.caption(f"Waterfall plot using original feature names.")
+        st.caption("Waterfall plot using original feature names.")
         fig1 = plot_waterfall(full_exp, total_features=TOTAL_FEATURES)
         st.pyplot(fig1, use_container_width=True)
 
     with tab3:
-        st.caption(f"Features ranked by absolute SHAP magnitude.")
+        st.caption("Features ranked by absolute SHAP magnitude.")
         display_df = shap_df.copy()
         for col in ["Input Value", "SHAP Value", "Absolute SHAP"]:
             display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
         st.dataframe(display_df, use_container_width=True)
 
-# =========================================================
-# 10. Footer
-# =========================================================
 st.markdown("""
 <div class="footer-note">
-Research-use interface for the multimodal model. 
+Research-use interface for the multimodal model.
 </div>
 """, unsafe_allow_html=True)
