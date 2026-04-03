@@ -37,8 +37,8 @@ TARGET_MODEL_NAME = "SVM_rbf"
 APP_TITLE = "Prediction of Response to Immunotherapy Combined With Chemotherapy in Unresectable Advanced Gastric Cancer"
 APP_SUBTITLE = "Multimodal venous-phase CT and elasticity radiomics model for individual treatment response estimation"
 
-POSITIVE_LABEL_NAME = "Responder (CR/PR)"
-NEGATIVE_LABEL_NAME = "Non-responder (SD/PD)"
+POSITIVE_LABEL_NAME = "Responder"
+NEGATIVE_LABEL_NAME = "Non-responder"
 
 SHAP_NSAMPLES = 160
 BACKGROUND_N = 30
