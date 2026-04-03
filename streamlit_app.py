@@ -35,9 +35,9 @@ NEGATIVE_LABEL_NAME = "Non-responder"
 
 SHAP_NSAMPLES = 160
 BACKGROUND_N = 30
-FORCE_MAX_DISPLAY = 12
-FORCE_LABEL_WIDTH = 34
-FORCE_MAX_ROWS_PER_COL = 5
+FORCE_MAX_DISPLAY = 10
+FORCE_LABEL_WIDTH = 24
+FORCE_MAX_ROWS_PER_COL = 4
 
 st.markdown("""
 <style>
@@ -260,7 +260,7 @@ def build_shap_table(explanation):
         "Direction": np.where(values[order] >= 0, "Increase response probability", "Decrease response probability")
     }).sort_values("Absolute SHAP", ascending=False)
 
-def break_feature_name(name: str, width: int = 34) -> str:
+def break_feature_name(name: str, width: int = 24) -> str:
     name = str(name)
     for sep in ["_", ".", "-"]:
         name = name.replace(sep, sep + "\u200b")
@@ -270,10 +270,6 @@ def break_feature_name(name: str, width: int = 34) -> str:
         break_long_words=False,
         break_on_hyphens=False
     )
-
-def format_shap_value(v: float) -> str:
-    sign = "+" if v >= 0 else ""
-    return f"{sign}{v:.3f}"
 
 def draw_segment_patch(ax, x0, x1, y_center, height, color, arrow_size, direction="right"):
     if x1 < x0:
@@ -319,9 +315,9 @@ def layout_side_labels(
     min_x,
     max_x,
     span,
-    max_rows_per_col=5,
-    label_width=34,
-    y_start=0.72
+    max_rows_per_col=4,
+    label_width=24,
+    y_start=0.70
 ):
     if not segments:
         return [], 0, y_start
@@ -334,13 +330,32 @@ def layout_side_labels(
     else:
         ordered = sorted(segments, key=x_anchor, reverse=True)
 
-    cols = [
-        ordered[i:i + max_rows_per_col]
-        for i in range(0, len(ordered), max_rows_per_col)
-    ]
+    def make_label_text(seg):
+        return f"[{seg['display_no']}] " + break_feature_name(seg["name"], width=label_width)
 
-    label_offset = max(0.08 * span, 0.10)
-    col_step = max(0.18 * span, 0.18)
+    def estimate_row_height(label_text):
+        n_lines = label_text.count("\n") + 1
+        return 0.10 + (n_lines - 1) * 0.060
+
+    cols = []
+    current_col = []
+
+    for seg in ordered:
+        item = dict(seg)
+        item["label_text"] = make_label_text(seg)
+        item["row_height"] = estimate_row_height(item["label_text"])
+
+        if len(current_col) >= max_rows_per_col:
+            cols.append(current_col)
+            current_col = []
+
+        current_col.append(item)
+
+    if current_col:
+        cols.append(current_col)
+
+    label_offset = max(0.10 * span, 0.14)
+    col_step = max(0.30 * span, 0.28)
 
     if side == "right":
         x_base = max_x + label_offset
@@ -358,23 +373,17 @@ def layout_side_labels(
             x_text = x_base - col_idx * col_step
             ha = "right"
 
-        y_cursor = y_start
+        y_cursor = y_start + (0.05 if col_idx % 2 == 1 else 0.0)
 
         for seg in col_segments:
-            label_text = f"[{seg['display_no']}] " + break_feature_name(seg["name"], width=label_width)
-            n_lines = label_text.count("\n") + 1
-            row_height = max(0.11, 0.06 + (n_lines - 1) * 0.055)
-
             laid_out.append({
                 **seg,
-                "label_text": label_text,
                 "x_text": x_text,
                 "y_text": y_cursor,
                 "ha": ha
             })
-
             max_y_used = max(max_y_used, y_cursor)
-            y_cursor += row_height
+            y_cursor += seg["row_height"]
 
     return laid_out, len(cols), max_y_used
 
@@ -452,7 +461,7 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
         span=span,
         max_rows_per_col=FORCE_MAX_ROWS_PER_COL,
         label_width=FORCE_LABEL_WIDTH,
-        y_start=0.72
+        y_start=0.70
     )
 
     right_labels, right_cols, right_max_y = layout_side_labels(
@@ -463,19 +472,18 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
         span=span,
         max_rows_per_col=FORCE_MAX_ROWS_PER_COL,
         label_width=FORCE_LABEL_WIDTH,
-        y_start=0.72
+        y_start=0.70
     )
 
-    col_step = max(0.18 * span, 0.18)
-    side_pad = max(0.12 * span, 0.18)
+    col_step = max(0.30 * span, 0.28)
+    side_pad = max(0.14 * span, 0.20)
 
-    left_margin = side_pad + max(0, left_cols - 1) * col_step + 0.22 * span
-    right_margin = side_pad + max(0, right_cols - 1) * col_step + 0.22 * span
+    left_margin = side_pad + max(0, left_cols - 1) * col_step + 0.34 * span
+    right_margin = side_pad + max(0, right_cols - 1) * col_step + 0.34 * span
 
-    y_top = max(left_max_y, right_max_y) + 0.22
-
+    y_top = max(left_max_y, right_max_y) + 0.24
     n_label_items = max(len(left_labels), len(right_labels), 1)
-    fig_height = min(max(5.8, 4.8 + 0.18 * n_label_items), 9.2)
+    fig_height = min(max(6.0, 5.0 + 0.17 * n_label_items), 9.5)
 
     plt.close("all")
     old_rc = plt.rcParams.copy()
@@ -486,7 +494,7 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
         "axes.unicode_minus": False
     })
 
-    fig, ax = plt.subplots(figsize=(17, fig_height), dpi=300)
+    fig, ax = plt.subplots(figsize=(18, fig_height), dpi=300)
 
     bar_y = 0.0
     bar_h = 0.34
@@ -534,7 +542,7 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
                 str(seg["display_no"]),
                 ha="center",
                 va="center",
-                fontsize=8.1,
+                fontsize=8.0,
                 color="white" if seg["value"] > 0 else "#3A3A3A",
                 fontweight="bold"
             )
@@ -545,7 +553,7 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
                 str(seg["display_no"]),
                 ha="center",
                 va="bottom",
-                fontsize=6.7,
+                fontsize=6.5,
                 color="#4B5563",
                 fontweight="bold"
             )
@@ -571,9 +579,9 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
             item["label_text"],
             ha=item["ha"],
             va="bottom",
-            fontsize=7.8,
+            fontsize=7.4,
             color=text_color,
-            linespacing=1.05,
+            linespacing=1.04,
             clip_on=False
         )
 
