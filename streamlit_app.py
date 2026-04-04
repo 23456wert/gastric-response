@@ -14,9 +14,6 @@ import streamlit as st
 from matplotlib.patches import Polygon
 
 
-# =========================
-# App configuration
-# =========================
 st.set_page_config(
     page_title="UAGC Immunochemotherapy Response Predictor",
     page_icon="🧬",
@@ -33,12 +30,9 @@ class AppConfig:
     x_train_path: Path = APP_DIR / "x_train.csv"
     y_train_path: Path = APP_DIR / "y_train.csv"
     scaler_path: Path = APP_DIR / "zscore_scaler.pkl"
-
     fixed_threshold: float = 0.4629352474478095
-
     model_alias: str = "SVM_rbf"
     target_model_name: str = "SVM_rbf"
-
     app_title: str = (
         "Prediction of Response to Immunotherapy Combined With Chemotherapy "
         "in Unresectable Advanced Gastric Cancer"
@@ -47,10 +41,8 @@ class AppConfig:
         "Multimodal venous-phase CT and elasticity radiomics model for "
         "individual treatment response estimation"
     )
-
     positive_label: str = "Responder"
     negative_label: str = "Non-responder"
-
     shap_nsamples: int = 160
     background_n: int = 30
     force_max_display: int = 10
@@ -161,9 +153,6 @@ APP_STYLE = """
 st.markdown(APP_STYLE, unsafe_allow_html=True)
 
 
-# =========================
-# Data containers
-# =========================
 @dataclass
 class Assets:
     model: object
@@ -191,14 +180,10 @@ class ExplanationBundle:
     table: pd.DataFrame
 
 
-# =========================
-# Generic helpers
-# =========================
 def stop_if_missing(paths: list[Path]) -> None:
     missing = [p.name for p in paths if not p.exists()]
     if not missing:
         return
-
     st.error("Missing required files in repository root:")
     for name in missing:
         st.write(f"- {name}")
@@ -215,17 +200,21 @@ def mpl_rc(params: dict):
         plt.rcParams.update(old_rc)
 
 
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    removable = [c for c in ("ID", "Id", "id", "Unnamed: 0") if c in df.columns]
-    df = df.drop(columns=removable, errors="ignore") if removable else df
-
-    # 2) 统一列名：把 -, (), 空格, 逗号等替换为下划线
-    df.columns = (
-        df.columns.astype(str)
+def normalize_feature_names(columns) -> pd.Index:
+    return (
+        pd.Index(columns)
+        .astype(str)
         .str.replace(r"[-(),\s]+", "_", regex=True)
         .str.strip("_")
     )
 
+
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    removable = [c for c in ("ID", "Id", "id", "Unnamed: 0") if c in df.columns]
+    if removable:
+        df = df.drop(columns=removable, errors="ignore")
+    df.columns = normalize_feature_names(df.columns)
     return df
 
 
@@ -255,8 +244,8 @@ def render_metric_card(title: str, value: str, sub: str = "") -> None:
             '<div class="metric-card">'
             f'<div class="metric-title">{title}</div>'
             f'<div class="metric-value">{value}</div>'
-            f'{sub_html}'
-            '</div>'
+            f"{sub_html}"
+            "</div>"
         ),
         unsafe_allow_html=True,
     )
@@ -280,15 +269,17 @@ def render_sidebar(total_features: int) -> None:
         st.caption("Research-use interface only. This tool does not replace clinical judgment.")
 
 
-# =========================
-# Loaders / preprocessing
-# =========================
 @st.cache_resource(show_spinner=True)
 def load_assets() -> Assets:
     model = joblib.load(CFG.model_path)
     scaler = joblib.load(CFG.scaler_path)
-
     x_train = clean_columns(pd.read_csv(CFG.x_train_path))
+
+    if hasattr(scaler, "feature_names_in_"):
+        scaler.feature_names_in_ = normalize_feature_names(scaler.feature_names_in_).to_numpy()
+
+    if hasattr(model, "feature_names_in_"):
+        model.feature_names_in_ = normalize_feature_names(model.feature_names_in_).to_numpy()
 
     y_train_df = pd.read_csv(CFG.y_train_path)
     if "label" not in y_train_df.columns:
@@ -320,13 +311,42 @@ def build_explainer(_model, background_df: pd.DataFrame):
 
 
 def transform_input_with_scaler(input_df_raw: pd.DataFrame, scaler, feature_names: list[str]) -> pd.DataFrame:
-    x = input_df_raw[feature_names].copy()
+    x = input_df_raw.copy()
+
+    if hasattr(scaler, "feature_names_in_"):
+        scaler_features = list(scaler.feature_names_in_)
+        missing_cols = [c for c in scaler_features if c not in x.columns]
+        if missing_cols:
+            raise ValueError(
+                "Input is missing columns required by scaler: "
+                + ", ".join(missing_cols[:20])
+                + (" ..." if len(missing_cols) > 20 else "")
+            )
+        x = x[scaler_features]
+        out_columns = scaler_features
+    else:
+        x = x[feature_names].copy()
+        out_columns = feature_names
+
     x_scaled = scaler.transform(x)
-    return pd.DataFrame(x_scaled, columns=feature_names, index=x.index)
+    return pd.DataFrame(x_scaled, columns=out_columns, index=x.index)
 
 
 def predict_positive_proba(model, x_model_df: pd.DataFrame) -> np.ndarray:
-    return model.predict_proba(x_model_df)[:, 1]
+    x = x_model_df.copy()
+
+    if hasattr(model, "feature_names_in_"):
+        model_features = list(model.feature_names_in_)
+        missing_cols = [c for c in model_features if c not in x.columns]
+        if missing_cols:
+            raise ValueError(
+                "Input is missing columns required by model: "
+                + ", ".join(missing_cols[:20])
+                + (" ..." if len(missing_cols) > 20 else "")
+            )
+        x = x[model_features]
+
+    return model.predict_proba(x)[:, 1]
 
 
 def build_input_data(user_inputs: dict[str, float], feature_names: list[str]) -> pd.DataFrame:
@@ -345,9 +365,6 @@ def run_prediction(model, input_df_model: pd.DataFrame) -> PredictionResult:
     )
 
 
-# =========================
-# SHAP helpers
-# =========================
 def shap_for_single_case(explainer, input_df_model: pd.DataFrame, nsamples: int) -> shap.Explanation:
     shap_values = explainer.shap_values(input_df_model.values, nsamples=nsamples)
     if isinstance(shap_values, list):
@@ -419,9 +436,6 @@ def prepare_explanations(explainer, input_df_raw: pd.DataFrame, input_df_model: 
     return ExplanationBundle(full=full, force=force, waterfall=waterfall, table=table)
 
 
-# =========================
-# Plotting helpers
-# =========================
 def draw_segment_patch(ax, x0, x1, y_center, height, color, arrow_size, direction: str) -> None:
     if x1 < x0:
         x0, x1 = x1, x0
@@ -705,9 +719,6 @@ def plot_probability_bar(prob_pos: float):
     return fig
 
 
-# =========================
-# UI helpers
-# =========================
 def make_input_widgets(feature_meta: dict[str, dict[str, str]], feature_names: list[str]) -> dict[str, float]:
     group_order = ["Elasticity Features", "Venous-phase CT Features", "Other Features"]
     grouped = {group: [] for group in group_order}
@@ -765,8 +776,8 @@ def render_header(total_features: int) -> None:
         (
             '<div class="note-card">'
             f'The deployment uses a fixed decision threshold of <b>{CFG.fixed_threshold:.6f}</b>. '
-            'Raw input values will be transformed by the saved Z-score scaler before prediction and SHAP analysis.'
-            '</div>'
+            "Raw input values will be transformed by the saved Z-score scaler before prediction and SHAP analysis."
+            "</div>"
         ),
         unsafe_allow_html=True,
     )
@@ -799,7 +810,7 @@ def render_probability_section(result: PredictionResult) -> None:
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.subheader("Probability Visualization")
     st.pyplot(plot_probability_bar(result.positive_proba), use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_shap_section(bundle: ExplanationBundle, result: PredictionResult, total_features: int) -> None:
@@ -840,9 +851,6 @@ def render_shap_section(bundle: ExplanationBundle, result: PredictionResult, tot
             st.error(f"SHAP feature table rendering failed: {exc}")
 
 
-# =========================
-# Main app
-# =========================
 def main() -> None:
     stop_if_missing([CFG.model_path, CFG.x_train_path, CFG.y_train_path, CFG.scaler_path])
 
@@ -858,9 +866,9 @@ def main() -> None:
         st.markdown(
             (
                 '<div class="small-muted">'
-                'Enter raw patient-specific radiomics feature values below. '
-                'The app will automatically apply the training-time Z-score transformation before prediction.'
-                '</div>'
+                "Enter raw patient-specific radiomics feature values below. "
+                "The app will automatically apply the training-time Z-score transformation before prediction."
+                "</div>"
             ),
             unsafe_allow_html=True,
         )
