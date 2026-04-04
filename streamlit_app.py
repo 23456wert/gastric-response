@@ -1,46 +1,67 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
+from contextlib import contextmanager
 import textwrap
 
 import joblib
-import shap
 import numpy as np
 import pandas as pd
+import shap
 import matplotlib.pyplot as plt
 import streamlit as st
 from matplotlib.patches import Polygon
 
+
+# =========================
+# App configuration
+# =========================
 st.set_page_config(
     page_title="UAGC Immunochemotherapy Response Predictor",
     page_icon="🧬",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 APP_DIR = Path(__file__).resolve().parent
 
-MODEL_PATH = APP_DIR / "SVM_rbf.pkl"
-X_TRAIN_PATH = APP_DIR / "x_train.csv"
-Y_TRAIN_PATH = APP_DIR / "y_train.csv"
-SCALER_PATH = APP_DIR / "zscore_scaler.pkl"
 
-FIXED_THRESHOLD = 0.4629352474478095
+@dataclass(frozen=True)
+class AppConfig:
+    model_path: Path = APP_DIR / "SVM_rbf.pkl"
+    x_train_path: Path = APP_DIR / "x_train.csv"
+    y_train_path: Path = APP_DIR / "y_train.csv"
+    scaler_path: Path = APP_DIR / "zscore_scaler.pkl"
 
-MODEL_ALIAS = "SVM_rbf"
-TARGET_MODEL_NAME = "SVM_rbf"
+    fixed_threshold: float = 0.4629352474478095
 
-APP_TITLE = "Prediction of Response to Immunotherapy Combined With Chemotherapy in Unresectable Advanced Gastric Cancer"
-APP_SUBTITLE = "Multimodal venous-phase CT and elasticity radiomics model for individual treatment response estimation"
+    model_alias: str = "SVM_rbf"
+    target_model_name: str = "SVM_rbf"
 
-POSITIVE_LABEL_NAME = "Responder"
-NEGATIVE_LABEL_NAME = "Non-responder"
+    app_title: str = (
+        "Prediction of Response to Immunotherapy Combined With Chemotherapy "
+        "in Unresectable Advanced Gastric Cancer"
+    )
+    app_subtitle: str = (
+        "Multimodal venous-phase CT and elasticity radiomics model for "
+        "individual treatment response estimation"
+    )
 
-SHAP_NSAMPLES = 160
-BACKGROUND_N = 30
-FORCE_MAX_DISPLAY = 10
-FORCE_LABEL_WIDTH = 24
-FORCE_MAX_ROWS_PER_COL = 4
+    positive_label: str = "Responder"
+    negative_label: str = "Non-responder"
 
-st.markdown("""
+    shap_nsamples: int = 160
+    background_n: int = 30
+    force_max_display: int = 10
+    force_label_width: int = 24
+    force_max_rows_per_col: int = 4
+
+
+CFG = AppConfig()
+
+
+APP_STYLE = """
 <style>
     .main { background: linear-gradient(180deg, #f7f9fc 0%, #f4f7fb 100%); }
     .block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1500px; }
@@ -135,22 +156,69 @@ st.markdown("""
         box-shadow: 0 4px 14px rgba(31,45,61,0.05);
     }
 </style>
-""", unsafe_allow_html=True)
+"""
 
-def check_required_files():
-    required = [MODEL_PATH, X_TRAIN_PATH, Y_TRAIN_PATH, SCALER_PATH]
-    missing = [p.name for p in required if not p.exists()]
-    if missing:
-        st.error("Missing required files in repository root:")
-        for name in missing:
-            st.write(f"- {name}")
-        st.stop()
+st.markdown(APP_STYLE, unsafe_allow_html=True)
+
+
+# =========================
+# Data containers
+# =========================
+@dataclass
+class Assets:
+    model: object
+    scaler: object
+    x_train: pd.DataFrame
+    y_train: np.ndarray
+    feature_names: list[str]
+    feature_meta: dict[str, dict[str, str]]
+    background: pd.DataFrame
+
+
+@dataclass
+class PredictionResult:
+    positive_proba: float
+    negative_proba: float
+    predicted_class: int
+    predicted_label: str
+
+
+@dataclass
+class ExplanationBundle:
+    full: shap.Explanation
+    force: shap.Explanation
+    waterfall: shap.Explanation
+    table: pd.DataFrame
+
+
+# =========================
+# Generic helpers
+# =========================
+def stop_if_missing(paths: list[Path]) -> None:
+    missing = [p.name for p in paths if not p.exists()]
+    if not missing:
+        return
+
+    st.error("Missing required files in repository root:")
+    for name in missing:
+        st.write(f"- {name}")
+    st.stop()
+
+
+@contextmanager
+def mpl_rc(params: dict):
+    old_rc = plt.rcParams.copy()
+    plt.rcParams.update(params)
+    try:
+        yield
+    finally:
+        plt.rcParams.update(old_rc)
+
 
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    drop_cols = [c for c in ["ID", "Id", "id", "Unnamed: 0"] if c in df.columns]
-    if drop_cols:
-        df = df.drop(columns=drop_cols, errors="ignore")
-    return df
+    removable = [c for c in ("ID", "Id", "id", "Unnamed: 0") if c in df.columns]
+    return df.drop(columns=removable, errors="ignore") if removable else df
+
 
 def infer_feature_group(feature_name: str) -> str:
     if "Elasticity" in feature_name:
@@ -159,214 +227,266 @@ def infer_feature_group(feature_name: str) -> str:
         return "Venous-phase CT Features"
     return "Other Features"
 
+
 def format_widget_label(name: str, max_len: int = 150) -> str:
-    if len(name) > max_len:
-        return name[:max_len - 1] + "…"
-    return name
+    return name if len(name) <= max_len else f"{name[:max_len - 1]}…"
 
-def transform_input_with_scaler(input_df_raw: pd.DataFrame, scaler, feature_names) -> pd.DataFrame:
-    X = input_df_raw.copy()
-    X = X[feature_names]
-    X_scaled = scaler.transform(X)
-    return pd.DataFrame(X_scaled, columns=feature_names, index=X.index)
 
+def break_feature_name(name: str, width: int) -> str:
+    name = str(name)
+    for sep in ("_", ".", "-"):
+        name = name.replace(sep, sep + "\u200b")
+    return textwrap.fill(name, width=width, break_long_words=False, break_on_hyphens=False)
+
+
+def render_metric_card(title: str, value: str, sub: str = "") -> None:
+    sub_html = f'<div class="metric-sub">{sub}</div>' if sub else ""
+    st.markdown(
+        (
+            '<div class="metric-card">'
+            f'<div class="metric-title">{title}</div>'
+            f'<div class="metric-value">{value}</div>'
+            f'{sub_html}'
+            '</div>'
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_result_banner(text: str, positive: bool) -> None:
+    css_class = "result-positive" if positive else "result-negative"
+    st.markdown(f'<div class="{css_class}">{text}</div>', unsafe_allow_html=True)
+
+
+def render_sidebar(total_features: int) -> None:
+    with st.sidebar:
+        st.header("Model Overview")
+        st.write(f"**Model:** {CFG.model_alias}")
+        st.write(f"**Classifier:** {CFG.target_model_name}")
+        st.write(f"**Total Features:** {total_features}")
+        st.write(f"**Decision threshold:** {CFG.fixed_threshold:.6f}")
+        st.write(f"**Force plot features:** Top {min(CFG.force_max_display, total_features)}")
+        st.write(f"**Scaler:** {CFG.scaler_path.name}")
+        st.markdown("---")
+        st.caption("Research-use interface only. This tool does not replace clinical judgment.")
+
+
+# =========================
+# Loaders / preprocessing
+# =========================
 @st.cache_resource(show_spinner=True)
-def load_assets():
-    model = joblib.load(MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
+def load_assets() -> Assets:
+    model = joblib.load(CFG.model_path)
+    scaler = joblib.load(CFG.scaler_path)
 
-    x_train = pd.read_csv(X_TRAIN_PATH)
-    x_train = clean_columns(x_train)
+    x_train = clean_columns(pd.read_csv(CFG.x_train_path))
 
-    y_train = pd.read_csv(Y_TRAIN_PATH)
-    if "label" not in y_train.columns:
+    y_train_df = pd.read_csv(CFG.y_train_path)
+    if "label" not in y_train_df.columns:
         raise ValueError("y_train.csv missing column 'label'")
-    y_train = y_train["label"].astype(int).values
+    y_train = y_train_df["label"].astype(int).to_numpy()
 
     feature_names = list(x_train.columns)
+    feature_meta = {name: {"group": infer_feature_group(name)} for name in feature_names}
+    background = x_train.sample(min(CFG.background_n, len(x_train)), random_state=42)
 
-    feature_meta = {}
-    for col in feature_names:
-        feature_meta[col] = {
-            "group": infer_feature_group(col)
-        }
+    return Assets(
+        model=model,
+        scaler=scaler,
+        x_train=x_train,
+        y_train=y_train,
+        feature_names=feature_names,
+        feature_meta=feature_meta,
+        background=background,
+    )
 
-    background = x_train.sample(min(BACKGROUND_N, len(x_train)), random_state=42)
-    return model, scaler, x_train, y_train, feature_names, feature_meta, background
-
-def predict_positive_proba(model, X_model_df: pd.DataFrame) -> np.ndarray:
-    proba = model.predict_proba(X_model_df)
-    return proba[:, 1]
 
 @st.cache_resource(show_spinner=False)
-def build_explainer(_model, background_df):
-    def f(data):
+def build_explainer(_model, background_df: pd.DataFrame):
+    def predict_fn(data):
         data_df = pd.DataFrame(data, columns=background_df.columns)
         return predict_positive_proba(_model, data_df)
-    return shap.KernelExplainer(f, background_df.values)
 
-def shap_for_single_case(explainer, input_df_model, nsamples=160):
+    return shap.KernelExplainer(predict_fn, background_df.values)
+
+
+def transform_input_with_scaler(input_df_raw: pd.DataFrame, scaler, feature_names: list[str]) -> pd.DataFrame:
+    x = input_df_raw[feature_names].copy()
+    x_scaled = scaler.transform(x)
+    return pd.DataFrame(x_scaled, columns=feature_names, index=x.index)
+
+
+def predict_positive_proba(model, x_model_df: pd.DataFrame) -> np.ndarray:
+    return model.predict_proba(x_model_df)[:, 1]
+
+
+def build_input_data(user_inputs: dict[str, float], feature_names: list[str]) -> pd.DataFrame:
+    return pd.DataFrame([[user_inputs[name] for name in feature_names]], columns=feature_names)
+
+
+def run_prediction(model, input_df_model: pd.DataFrame) -> PredictionResult:
+    positive_proba = float(predict_positive_proba(model, input_df_model)[0])
+    predicted_class = int(positive_proba >= CFG.fixed_threshold)
+    predicted_label = CFG.positive_label if predicted_class == 1 else CFG.negative_label
+    return PredictionResult(
+        positive_proba=positive_proba,
+        negative_proba=1 - positive_proba,
+        predicted_class=predicted_class,
+        predicted_label=predicted_label,
+    )
+
+
+# =========================
+# SHAP helpers
+# =========================
+def shap_for_single_case(explainer, input_df_model: pd.DataFrame, nsamples: int) -> shap.Explanation:
     shap_values = explainer.shap_values(input_df_model.values, nsamples=nsamples)
     if isinstance(shap_values, list):
         shap_values = shap_values[0]
 
-    if isinstance(explainer.expected_value, (list, np.ndarray)):
-        base_value = float(np.array(explainer.expected_value).reshape(-1)[0])
+    expected_value = explainer.expected_value
+    if isinstance(expected_value, (list, np.ndarray)):
+        base_value = float(np.asarray(expected_value).reshape(-1)[0])
     else:
-        base_value = float(explainer.expected_value)
+        base_value = float(expected_value)
 
     return shap.Explanation(
-        values=np.array(shap_values).reshape(-1),
+        values=np.asarray(shap_values).reshape(-1),
         base_values=base_value,
-        data=input_df_model.iloc[0].values,
-        feature_names=input_df_model.columns.tolist()
+        data=input_df_model.iloc[0].to_numpy(),
+        feature_names=input_df_model.columns.tolist(),
     )
 
-def subset_explanation(explanation, top_n=None):
-    values = np.array(explanation.values)
-    names = np.array(explanation.feature_names)
-    data = np.array(explanation.data)
+
+def subset_explanation(explanation: shap.Explanation, top_n: int | None = None) -> shap.Explanation:
+    values = np.asarray(explanation.values)
+    names = np.asarray(explanation.feature_names)
+    data = np.asarray(explanation.data)
 
     if top_n is None:
         top_n = len(values)
 
     order = np.argsort(np.abs(values))[::-1][:top_n]
-
     return shap.Explanation(
         values=values[order],
         base_values=float(explanation.base_values),
         data=data[order],
-        feature_names=names[order].tolist()
+        feature_names=names[order].tolist(),
     )
 
-def build_shap_table(explanation, input_df_raw=None, input_df_model=None):
-    values = np.array(explanation.values)
-    names = np.array(explanation.feature_names)
+
+def build_shap_table(
+    explanation: shap.Explanation,
+    input_df_raw: pd.DataFrame | None = None,
+    input_df_model: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    values = np.asarray(explanation.values)
+    names = np.asarray(explanation.feature_names)
     order = np.argsort(np.abs(values))[::-1]
 
     data = {
         "Feature Name": names[order],
         "SHAP Value": values[order],
         "Absolute SHAP": np.abs(values[order]),
-        "Direction": np.where(values[order] >= 0, "Increase response probability", "Decrease response probability")
+        "Direction": np.where(values[order] >= 0, "Increase response probability", "Decrease response probability"),
     }
 
     if input_df_raw is not None:
         raw_series = input_df_raw.iloc[0]
-        data["Raw Input"] = raw_series.loc[names[order]].values
+        data["Raw Input"] = raw_series.loc[names[order]].to_numpy()
 
     if input_df_model is not None:
         model_series = input_df_model.iloc[0]
-        data["Standardized Input"] = model_series.loc[names[order]].values
+        data["Standardized Input"] = model_series.loc[names[order]].to_numpy()
 
     return pd.DataFrame(data).sort_values("Absolute SHAP", ascending=False)
 
-def break_feature_name(name: str, width: int = 24) -> str:
-    name = str(name)
-    for sep in ["_", ".", "-"]:
-        name = name.replace(sep, sep + "\u200b")
-    return textwrap.fill(
-        name,
-        width=width,
-        break_long_words=False,
-        break_on_hyphens=False
-    )
 
-def draw_segment_patch(ax, x0, x1, y_center, height, color, arrow_size, direction="right"):
+def prepare_explanations(explainer, input_df_raw: pd.DataFrame, input_df_model: pd.DataFrame, total_features: int) -> ExplanationBundle:
+    full = shap_for_single_case(explainer, input_df_model, nsamples=CFG.shap_nsamples)
+    force = subset_explanation(full, top_n=min(CFG.force_max_display, total_features))
+    waterfall = subset_explanation(full, top_n=total_features)
+    table = build_shap_table(full, input_df_raw=input_df_raw, input_df_model=input_df_model)
+    return ExplanationBundle(full=full, force=force, waterfall=waterfall, table=table)
+
+
+# =========================
+# Plotting helpers
+# =========================
+def draw_segment_patch(ax, x0, x1, y_center, height, color, arrow_size, direction: str) -> None:
     if x1 < x0:
         x0, x1 = x1, x0
 
     width = x1 - x0
     arrow = min(arrow_size, width * 0.45) if width > 0 else arrow_size
-    y0 = y_center - height / 2.0
-    y1 = y_center + height / 2.0
+    y0, y1 = y_center - height / 2.0, y_center + height / 2.0
 
     if direction == "right":
-        pts = [
-            (x0, y0),
-            (x1 - arrow, y0),
-            (x1, y_center),
-            (x1 - arrow, y1),
-            (x0, y1),
-            (x0 + arrow, y_center)
-        ]
+        points = [(x0, y0), (x1 - arrow, y0), (x1, y_center), (x1 - arrow, y1), (x0, y1), (x0 + arrow, y_center)]
     else:
-        pts = [
-            (x0 + arrow, y0),
-            (x1, y0),
-            (x1 - arrow, y_center),
-            (x1, y1),
-            (x0 + arrow, y1),
-            (x0, y_center)
-        ]
+        points = [(x0 + arrow, y0), (x1, y0), (x1 - arrow, y_center), (x1, y1), (x0 + arrow, y1), (x0, y_center)]
 
-    poly = Polygon(
-        pts,
-        closed=True,
-        facecolor=color,
-        edgecolor="white",
-        linewidth=1.0,
-        joinstyle="round"
+    ax.add_patch(
+        Polygon(
+            points,
+            closed=True,
+            facecolor=color,
+            edgecolor="white",
+            linewidth=1.0,
+            joinstyle="round",
+        )
     )
-    ax.add_patch(poly)
+
 
 def layout_side_labels(
-    segments,
-    side,
-    min_x,
-    max_x,
-    span,
-    max_rows_per_col=4,
-    label_width=24,
-    y_start=0.70
+    segments: list[dict],
+    side: str,
+    min_x: float,
+    max_x: float,
+    span: float,
+    max_rows_per_col: int,
+    label_width: int,
+    y_start: float = 0.70,
 ):
     if not segments:
         return [], 0, y_start
 
     def x_anchor(seg):
-        return (min(seg["x0"], seg["x1"]) + max(seg["x0"], seg["x1"])) / 2.0
+        return (min(seg["x0"], seg["x1"]) + max(seg["x0"], seg["x1"]))/2.0
 
-    if side == "right":
-        ordered = sorted(segments, key=x_anchor)
-    else:
-        ordered = sorted(segments, key=x_anchor, reverse=True)
+    ordered = sorted(segments, key=x_anchor, reverse=(side == "left"))
 
-    def make_label_text(seg):
+    def label_text(seg: dict) -> str:
         return f"[{seg['display_no']}] " + break_feature_name(seg["name"], width=label_width)
 
-    def estimate_row_height(label_text):
-        n_lines = label_text.count("\n") + 1
-        return 0.10 + (n_lines - 1) * 0.060
+    def row_height(text: str) -> float:
+        line_count = text.count("\n") + 1
+        return 0.10 + (line_count - 1) * 0.060
 
-    cols = []
-    current_col = []
+    columns: list[list[dict]] = []
+    current_col: list[dict] = []
 
     for seg in ordered:
         item = dict(seg)
-        item["label_text"] = make_label_text(seg)
-        item["row_height"] = estimate_row_height(item["label_text"])
+        item["label_text"] = label_text(seg)
+        item["row_height"] = row_height(item["label_text"])
 
         if len(current_col) >= max_rows_per_col:
-            cols.append(current_col)
+            columns.append(current_col)
             current_col = []
-
         current_col.append(item)
 
     if current_col:
-        cols.append(current_col)
+        columns.append(current_col)
 
     label_offset = max(0.10 * span, 0.14)
     col_step = max(0.30 * span, 0.28)
-
-    if side == "right":
-        x_base = max_x + label_offset
-    else:
-        x_base = min_x - label_offset
+    x_base = max_x + label_offset if side == "right" else min_x - label_offset
 
     laid_out = []
     max_y_used = y_start
 
-    for col_idx, col_segments in enumerate(cols):
+    for col_idx, col in enumerate(columns):
         if side == "right":
             x_text = x_base + col_idx * col_step
             ha = "left"
@@ -374,84 +494,41 @@ def layout_side_labels(
             x_text = x_base - col_idx * col_step
             ha = "right"
 
-        y_cursor = y_start + (0.05 if col_idx % 2 == 1 else 0.0)
-
-        for seg in col_segments:
-            laid_out.append({
-                **seg,
-                "x_text": x_text,
-                "y_text": y_cursor,
-                "ha": ha
-            })
+        y_cursor = y_start + (0.05 if col_idx % 2 else 0.0)
+        for seg in col:
+            laid_out.append({**seg, "x_text": x_text, "y_text": y_cursor, "ha": ha})
             max_y_used = max(max_y_used, y_cursor)
             y_cursor += seg["row_height"]
 
-    return laid_out, len(cols), max_y_used
+    return laid_out, len(columns), max_y_used
 
-def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
-    values = np.array(explanation.values, dtype=float)
-    names = np.array(explanation.feature_names, dtype=object)
 
-    if base_value is None:
-        base_value = float(explanation.base_values)
-    else:
-        base_value = float(base_value)
+def plot_guided_force_like(explanation: shap.Explanation, prediction_value: float | None = None, base_value: float | None = None):
+    values = np.asarray(explanation.values, dtype=float)
+    names = np.asarray(explanation.feature_names, dtype=object)
 
-    if prediction_value is None:
-        prediction_value = base_value + float(np.sum(values))
-    else:
-        prediction_value = float(prediction_value)
+    base_value = float(explanation.base_values if base_value is None else base_value)
+    prediction_value = float(base_value + np.sum(values) if prediction_value is None else prediction_value)
 
-    item_info = []
-    for i, (name, value) in enumerate(zip(names, values), start=1):
-        item_info.append({
-            "name": str(name),
-            "value": float(value),
-            "display_no": i
-        })
+    items = [{"name": str(name), "value": float(value), "display_no": i} for i, (name, value) in enumerate(zip(names, values), start=1)]
+    pos_items = sorted((x for x in items if x["value"] >= 0), key=lambda x: abs(x["value"]), reverse=True)
+    neg_items = sorted((x for x in items if x["value"] < 0), key=lambda x: abs(x["value"]), reverse=True)
 
-    pos_items = [x for x in item_info if x["value"] >= 0]
-    neg_items = [x for x in item_info if x["value"] < 0]
+    def build_segments(source_items: list[dict], start: float, positive: bool) -> list[dict]:
+        segments = []
+        current = start
+        for item in source_items:
+            value = item["value"]
+            x0, x1 = (current, current + value) if positive else (current + value, current)
+            segments.append({"name": item["name"], "value": value, "x0": x0, "x1": x1, "display_no": item["display_no"]})
+            current = x1 if positive else x0
+        return segments
 
-    pos_items = sorted(pos_items, key=lambda x: abs(x["value"]), reverse=True)
-    neg_items = sorted(neg_items, key=lambda x: abs(x["value"]), reverse=True)
+    neg_segments = build_segments(neg_items, base_value, positive=False)
+    pos_segments = build_segments(pos_items, base_value, positive=True)
 
-    neg_segments = []
-    current_left = base_value
-    for item in neg_items:
-        v = item["value"]
-        x0 = current_left + v
-        x1 = current_left
-        neg_segments.append({
-            "name": item["name"],
-            "value": v,
-            "x0": x0,
-            "x1": x1,
-            "display_no": item["display_no"]
-        })
-        current_left = x0
-
-    pos_segments = []
-    current_right = base_value
-    for item in pos_items:
-        v = item["value"]
-        x0 = current_right
-        x1 = current_right + v
-        pos_segments.append({
-            "name": item["name"],
-            "value": v,
-            "x0": x0,
-            "x1": x1,
-            "display_no": item["display_no"]
-        })
-        current_right = x1
-
-    xs = [base_value, prediction_value]
-    for s in neg_segments + pos_segments:
-        xs.extend([s["x0"], s["x1"]])
-
-    min_x = min(xs)
-    max_x = max(xs)
+    xs = [base_value, prediction_value] + [v for seg in (neg_segments + pos_segments) for v in (seg["x0"], seg["x1"])]
+    min_x, max_x = min(xs), max(xs)
     span = max(max_x - min_x, 1e-6)
 
     left_labels, left_cols, left_max_y = layout_side_labels(
@@ -460,25 +537,21 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
         min_x=min_x,
         max_x=max_x,
         span=span,
-        max_rows_per_col=FORCE_MAX_ROWS_PER_COL,
-        label_width=FORCE_LABEL_WIDTH,
-        y_start=0.70
+        max_rows_per_col=CFG.force_max_rows_per_col,
+        label_width=CFG.force_label_width,
     )
-
     right_labels, right_cols, right_max_y = layout_side_labels(
         pos_segments,
         side="right",
         min_x=min_x,
         max_x=max_x,
         span=span,
-        max_rows_per_col=FORCE_MAX_ROWS_PER_COL,
-        label_width=FORCE_LABEL_WIDTH,
-        y_start=0.70
+        max_rows_per_col=CFG.force_max_rows_per_col,
+        label_width=CFG.force_label_width,
     )
 
     col_step = max(0.30 * span, 0.28)
     side_pad = max(0.14 * span, 0.20)
-
     left_margin = side_pad + max(0, left_cols - 1) * col_step + 0.34 * span
     right_margin = side_pad + max(0, right_cols - 1) * col_step + 0.34 * span
 
@@ -487,196 +560,134 @@ def plot_guided_force_like(explanation, prediction_value=None, base_value=None):
     fig_height = min(max(6.0, 5.0 + 0.17 * n_label_items), 9.5)
 
     plt.close("all")
-    old_rc = plt.rcParams.copy()
-    plt.rcParams.update({
+    with mpl_rc({
         "font.family": "serif",
         "font.serif": ["Times New Roman", "Arial", "DejaVu Serif"],
         "font.size": 9,
-        "axes.unicode_minus": False
-    })
+        "axes.unicode_minus": False,
+    }):
+        fig, ax = plt.subplots(figsize=(18, fig_height), dpi=300)
 
-    fig, ax = plt.subplots(figsize=(18, fig_height), dpi=300)
+        bar_y, bar_h = 0.0, 0.34
+        neg_color, pos_color = "#F2C94C", "#B73779"
+        line_color, text_color = "#9AA3AF", "#2E3440"
+        arrow_size = max(0.018 * span, 0.015)
+        num_text_threshold = max(0.040 * span, 0.055)
 
-    bar_y = 0.0
-    bar_h = 0.34
+        for seg in neg_segments:
+            draw_segment_patch(ax, seg["x0"], seg["x1"], bar_y, bar_h, neg_color, arrow_size, direction="left")
+        for seg in pos_segments:
+            draw_segment_patch(ax, seg["x0"], seg["x1"], bar_y, bar_h, pos_color, arrow_size, direction="right")
 
-    neg_color = "#F2C94C"
-    pos_color = "#B73779"
-    line_color = "#9AA3AF"
-    text_color = "#2E3440"
+        for seg in neg_segments + pos_segments:
+            width = abs(seg["x1"] - seg["x0"])
+            x_center = (seg["x0"] + seg["x1"]) / 2.0
+            if width >= num_text_threshold:
+                ax.text(
+                    x_center,
+                    bar_y,
+                    str(seg["display_no"]),
+                    ha="center",
+                    va="center",
+                    fontsize=8.0,
+                    color="white" if seg["value"] > 0 else "#3A3A3A",
+                    fontweight="bold",
+                )
+            else:
+                ax.text(
+                    x_center,
+                    bar_y + bar_h / 2 + 0.05,
+                    str(seg["display_no"]),
+                    ha="center",
+                    va="bottom",
+                    fontsize=6.5,
+                    color="#4B5563",
+                    fontweight="bold",
+                )
 
-    arrow_size = max(0.018 * span, 0.015)
-    num_text_threshold = max(0.040 * span, 0.055)
-
-    for seg in neg_segments:
-        draw_segment_patch(
-            ax=ax,
-            x0=seg["x0"],
-            x1=seg["x1"],
-            y_center=bar_y,
-            height=bar_h,
-            color=neg_color,
-            arrow_size=arrow_size,
-            direction="left"
-        )
-
-    for seg in pos_segments:
-        draw_segment_patch(
-            ax=ax,
-            x0=seg["x0"],
-            x1=seg["x1"],
-            y_center=bar_y,
-            height=bar_h,
-            color=pos_color,
-            arrow_size=arrow_size,
-            direction="right"
-        )
-
-    for seg in neg_segments + pos_segments:
-        width = abs(seg["x1"] - seg["x0"])
-        xc = (seg["x0"] + seg["x1"]) / 2.0
-
-        if width >= num_text_threshold:
+        def draw_label(item: dict) -> None:
+            x_anchor = (min(item["x0"], item["x1"]) + max(item["x0"], item["x1"])) / 2.0
+            y_anchor = bar_y + bar_h / 2.0
+            y_knee = item["y_text"] - 0.035
+            ax.plot([x_anchor, x_anchor, item["x_text"]], [y_anchor, y_knee, y_knee], color=line_color, linewidth=0.8, solid_capstyle="round")
             ax.text(
-                xc,
-                bar_y,
-                str(seg["display_no"]),
-                ha="center",
-                va="center",
-                fontsize=8.0,
-                color="white" if seg["value"] > 0 else "#3A3A3A",
-                fontweight="bold"
-            )
-        else:
-            ax.text(
-                xc,
-                bar_y + bar_h / 2 + 0.05,
-                str(seg["display_no"]),
-                ha="center",
+                item["x_text"],
+                item["y_text"],
+                item["label_text"],
+                ha=item["ha"],
                 va="bottom",
-                fontsize=6.5,
-                color="#4B5563",
-                fontweight="bold"
+                fontsize=7.4,
+                color=text_color,
+                linespacing=1.04,
+                clip_on=False,
             )
 
-    def draw_label_item(item):
-        x_left = min(item["x0"], item["x1"])
-        x_right = max(item["x0"], item["x1"])
-        x_anchor = (x_left + x_right) / 2.0
-        y_anchor = bar_y + bar_h / 2.0
-        y_knee = item["y_text"] - 0.035
+        for item in left_labels + right_labels:
+            draw_label(item)
 
-        ax.plot(
-            [x_anchor, x_anchor, item["x_text"]],
-            [y_anchor, y_knee, y_knee],
-            color=line_color,
-            linewidth=0.8,
-            solid_capstyle="round"
-        )
+        ax.axvline(base_value, color="#9AA0AA", linestyle=(0, (3, 3)), linewidth=1.0, zorder=0)
+        ax.text(base_value, -0.46, "base value", ha="center", va="top", fontsize=8.5, color="#6B7280")
 
-        ax.text(
-            item["x_text"],
-            item["y_text"],
-            item["label_text"],
-            ha=item["ha"],
-            va="bottom",
-            fontsize=7.4,
-            color=text_color,
-            linespacing=1.04,
-            clip_on=False
-        )
+        ax.axvline(prediction_value, color="#7A7A7A", linestyle=(0, (3, 3)), linewidth=1.0, zorder=0)
+        ax.text(prediction_value, 0.16, f"f(x) = {prediction_value:.3f}", ha="center", va="bottom", fontsize=8.8, color="#444444")
 
-    for item in left_labels:
-        draw_label_item(item)
+        ax.set_xlim(min_x - left_margin, max_x + right_margin)
+        ax.set_ylim(-0.62, y_top)
+        ax.set_yticks([])
+        ax.set_xlabel("SHAP value", fontsize=10)
+        ax.tick_params(axis="x", labelsize=9)
+        ax.grid(False)
 
-    for item in right_labels:
-        draw_label_item(item)
+        ax.spines["left"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["bottom"].set_color("#AAB2BF")
+        ax.spines["bottom"].set_linewidth(1.0)
 
-    ax.axvline(base_value, color="#9AA0AA", linestyle=(0, (3, 3)), linewidth=1.0, zorder=0)
-    ax.text(
-        base_value,
-        -0.46,
-        "base value",
-        ha="center",
-        va="top",
-        fontsize=8.5,
-        color="#6B7280"
-    )
+        fig.subplots_adjust(left=0.05, right=0.95, top=0.92, bottom=0.20)
+        return fig
 
-    ax.axvline(prediction_value, color="#7A7A7A", linestyle=(0, (3, 3)), linewidth=1.0, zorder=0)
-    ax.text(
-        prediction_value,
-        0.16,
-        f"f(x) = {prediction_value:.3f}",
-        ha="center",
-        va="bottom",
-        fontsize=8.8,
-        color="#444444"
-    )
 
-    ax.set_xlim(min_x - left_margin, max_x + right_margin)
-    ax.set_ylim(-0.62, y_top)
-    ax.set_yticks([])
-    ax.set_xlabel("SHAP value", fontsize=10)
-    ax.tick_params(axis="x", labelsize=9)
-
-    ax.spines["left"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["top"].set_visible(False)
-    ax.spines["bottom"].set_color("#AAB2BF")
-    ax.spines["bottom"].set_linewidth(1.0)
-    ax.grid(False)
-
-    fig.subplots_adjust(left=0.05, right=0.95, top=0.92, bottom=0.20)
-
-    plt.rcParams.update(old_rc)
-    return fig
-
-def plot_waterfall(explanation, total_features):
+def plot_waterfall(explanation: shap.Explanation, total_features: int):
     plt.close("all")
-    old_rc = plt.rcParams.copy()
-    plt.rcParams.update({
+    fig_height = max(7.2, total_features * 0.35)
+    with mpl_rc({
         "font.size": 10,
         "axes.titlesize": 12,
         "axes.labelsize": 10,
         "figure.facecolor": "white",
         "axes.facecolor": "white",
         "font.family": "serif",
-        "font.serif": ["Times New Roman", "Arial", "DejaVu Serif"]
-    })
+        "font.serif": ["Times New Roman", "Arial", "DejaVu Serif"],
+    }):
+        plt.figure(figsize=(16, fig_height), dpi=300)
+        shap.plots.waterfall(explanation, max_display=total_features, show=False)
+        fig = plt.gcf()
+        fig.subplots_adjust(left=0.55, right=0.97, top=0.98, bottom=0.05)
+        return fig
 
-    fig_height = max(7.2, total_features * 0.35)
-    plt.figure(figsize=(16, fig_height), dpi=300)
-    shap.plots.waterfall(explanation, max_display=total_features, show=False)
-    fig = plt.gcf()
-    fig.subplots_adjust(left=0.55, right=0.97, top=0.98, bottom=0.05)
 
-    plt.rcParams.update(old_rc)
-    return fig
-
-def plot_probability_bar(prob_pos):
+def plot_probability_bar(prob_pos: float):
     prob_neg = 1 - prob_pos
-    labels = [NEGATIVE_LABEL_NAME, POSITIVE_LABEL_NAME]
+    labels = [CFG.negative_label, CFG.positive_label]
     probs = [prob_neg, prob_pos]
     colors = ["#b9c6d6", "#2f7ed8"]
 
     fig, ax = plt.subplots(figsize=(9, 2.8), dpi=300)
     bars = ax.barh(labels, probs, color=colors, edgecolor="none")
-
     ax.set_xlim(0, 1.0)
     ax.set_xlabel("Probability", fontsize=11, fontweight="bold")
     ax.set_title("Predicted Class Probabilities", fontsize=13, fontweight="bold")
 
-    for bar, val in zip(bars, probs):
-        x = min(val + 0.015, 0.96)
+    for bar, value in zip(bars, probs):
         ax.text(
-            x,
+            min(value + 0.015, 0.96),
             bar.get_y() + bar.get_height() / 2,
-            f"{val:.3f}",
+            f"{value:.3f}",
             va="center",
             ha="left",
             fontsize=10,
-            fontweight="bold"
+            fontweight="bold",
         )
 
     ax.spines["top"].set_visible(False)
@@ -684,218 +695,197 @@ def plot_probability_bar(prob_pos):
     plt.tight_layout()
     return fig
 
-def make_input_widgets(feature_meta, feature_names):
-    group_order = [
-        "Elasticity Features",
-        "Venous-phase CT Features",
-        "Other Features"
-    ]
 
-    grouped = {g: [] for g in group_order}
+# =========================
+# UI helpers
+# =========================
+def make_input_widgets(feature_meta: dict[str, dict[str, str]], feature_names: list[str]) -> dict[str, float]:
+    group_order = ["Elasticity Features", "Venous-phase CT Features", "Other Features"]
+    grouped = {group: [] for group in group_order}
+
     for feat in feature_names:
-        g = feature_meta[feat]["group"]
-        if g in grouped:
-            grouped[g].append(feat)
+        group = feature_meta[feat]["group"]
+        if group in grouped:
+            grouped[group].append(feat)
 
-    user_values = {}
-
+    values: dict[str, float] = {}
     for group_name in group_order:
         feats = grouped.get(group_name, [])
         if not feats:
             continue
 
         with st.expander(f"{group_name} ({len(feats)} features)", expanded=False):
-            cols = st.columns(3)
+            columns = st.columns(3)
             for idx, feat in enumerate(feats):
-                col = cols[idx % 3]
-                with col:
-                    user_values[feat] = st.number_input(
+                with columns[idx % 3]:
+                    values[feat] = st.number_input(
                         label=format_widget_label(feat),
                         value=0.0,
                         format="%.6f",
-                        key=f"input_{feat}"
+                        key=f"input_{feat}",
                     )
+    return values
 
-    return user_values
 
-def make_interpretation_text(prob_pos, threshold):
-    if prob_pos >= threshold:
-        return (
-            f"The estimated probability of response is {prob_pos:.3f}, "
-            f"which is above the threshold ({threshold:.6f}). "
-            f"The model classifies this patient as a {POSITIVE_LABEL_NAME}."
-        )
+def make_interpretation_text(result: PredictionResult) -> str:
+    comparator = "above" if result.positive_proba >= CFG.fixed_threshold else "below"
     return (
-        f"The estimated probability of response is {prob_pos:.3f}, "
-        f"which is below the threshold ({threshold:.6f}). "
-        f"The model classifies this patient as a {NEGATIVE_LABEL_NAME}."
+        f"The estimated probability of response is {result.positive_proba:.3f}, "
+        f"which is {comparator} the threshold ({CFG.fixed_threshold:.6f}). "
+        f"The model classifies this patient as a {result.predicted_label}."
     )
 
-check_required_files()
-model, scaler, x_train, y_train, feature_names, feature_meta, background = load_assets()
-explainer = build_explainer(model, background)
-TOTAL_FEATURES = len(feature_names)
 
-st.markdown(f"""
-<div class="hero-card">
-    <h1 style="margin-bottom:0.35rem;">{APP_TITLE}</h1>
-    <div style="font-size:1.02rem; color:#4f647a; line-height:1.5;">
-        {APP_SUBTITLE}<br>
-        <b>Deployed model:</b> {MODEL_ALIAS} &nbsp;|&nbsp;
-        <b>Classifier:</b> {TARGET_MODEL_NAME} &nbsp;|&nbsp;
-        <b>Total Features:</b> {TOTAL_FEATURES}
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown(
-    f'<div class="note-card">The deployment uses a fixed decision threshold of <b>{FIXED_THRESHOLD:.6f}</b>. Raw input values will be transformed by the saved Z-score scaler before prediction and SHAP analysis.</div>',
-    unsafe_allow_html=True
-)
-
-with st.sidebar:
-    st.header("Model Overview")
-    st.write(f"**Model:** {MODEL_ALIAS}")
-    st.write(f"**Classifier:** {TARGET_MODEL_NAME}")
-    st.write(f"**Total Features:** {TOTAL_FEATURES}")
-    st.write(f"**Decision threshold:** {FIXED_THRESHOLD:.6f}")
-    st.write(f"**Force plot features:** Top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)}")
-    st.write(f"**Scaler:** {SCALER_PATH.name}")
-    st.markdown("---")
-    st.caption("Research-use interface only. This tool does not replace clinical judgment.")
-
-st.subheader("Patient Feature Input")
-
-with st.form("prediction_form", clear_on_submit=False):
+def render_header(total_features: int) -> None:
     st.markdown(
-        '<div class="small-muted">Enter raw patient-specific radiomics feature values below. The app will automatically apply the training-time Z-score transformation before prediction.</div>',
-        unsafe_allow_html=True
+        f"""
+        <div class="hero-card">
+            <h1 style="margin-bottom:0.35rem;">{CFG.app_title}</h1>
+            <div style="font-size:1.02rem; color:#4f647a; line-height:1.5;">
+                {CFG.app_subtitle}<br>
+                <b>Deployed model:</b> {CFG.model_alias} &nbsp;|&nbsp;
+                <b>Classifier:</b> {CFG.target_model_name} &nbsp;|&nbsp;
+                <b>Total Features:</b> {total_features}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    user_inputs = make_input_widgets(feature_meta, feature_names)
 
-    c1, c2, c3 = st.columns([1.2, 1.2, 3.6])
-    with c1:
-        submitted = st.form_submit_button("Run Prediction", type="primary", use_container_width=True)
-    with c2:
-        preview = st.form_submit_button("Preview Inputs", use_container_width=True)
+    st.markdown(
+        (
+            '<div class="note-card">'
+            f'The deployment uses a fixed decision threshold of <b>{CFG.fixed_threshold:.6f}</b>. '
+            'Raw input values will be transformed by the saved Z-score scaler before prediction and SHAP analysis.'
+            '</div>'
+        ),
+        unsafe_allow_html=True,
+    )
 
-input_df_raw = pd.DataFrame([[user_inputs[f] for f in feature_names]], columns=feature_names)
-input_df_model = transform_input_with_scaler(input_df_raw, scaler, feature_names)
 
-if preview and not submitted:
+def render_preview(raw_df: pd.DataFrame, model_df: pd.DataFrame) -> None:
     preview_df = pd.DataFrame({
-        "Raw Input": input_df_raw.iloc[0],
-        "Standardized Input": input_df_model.iloc[0]
+        "Raw Input": raw_df.iloc[0],
+        "Standardized Input": model_df.iloc[0],
     })
     with st.expander("Current Input Table", expanded=True):
         st.dataframe(preview_df, use_container_width=True)
 
-if submitted:
-    positive_proba = float(predict_positive_proba(model, input_df_model)[0])
-    negative_proba = 1 - positive_proba
-    predicted_class = 1 if positive_proba >= FIXED_THRESHOLD else 0
-    predicted_label = POSITIVE_LABEL_NAME if predicted_class == 1 else NEGATIVE_LABEL_NAME
 
+def render_prediction_summary(result: PredictionResult) -> None:
     st.subheader("Prediction Summary")
-    c1, c2, c3 = st.columns(3)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        render_metric_card("Response Probability", f"{result.positive_proba * 100:.1f}%")
+    with col2:
+        render_metric_card("Predicted Category", result.predicted_label)
+    with col3:
+        render_metric_card("Non-response Probability", f"{result.negative_proba * 100:.1f}%")
 
-    with c1:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-title">Response Probability</div><div class="metric-value">{positive_proba * 100:.1f}%</div></div>',
-            unsafe_allow_html=True
-        )
-    with c2:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-title">Predicted Category</div><div class="metric-value" style="font-size:1.18rem;">{predicted_label}</div></div>',
-            unsafe_allow_html=True
-        )
-    with c3:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-title">Non-response Probability</div><div class="metric-value">{negative_proba * 100:.1f}%</div></div>',
-            unsafe_allow_html=True
-        )
+    st.progress(int(round(result.positive_proba * 100)))
+    render_result_banner(make_interpretation_text(result), positive=(result.predicted_class == 1))
 
-    st.progress(int(round(positive_proba * 100)))
 
-    interpretation_text = make_interpretation_text(positive_proba, FIXED_THRESHOLD)
-    if predicted_class == 1:
-        st.markdown(f'<div class="result-positive">{interpretation_text}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="result-negative">{interpretation_text}</div>', unsafe_allow_html=True)
-
+def render_probability_section(result: PredictionResult) -> None:
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.subheader("Probability Visualization")
-    prob_fig = plot_probability_bar(positive_proba)
-    st.pyplot(prob_fig, use_container_width=True)
+    st.pyplot(plot_probability_bar(result.positive_proba), use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.subheader("Model Explanation (SHAP)")
 
-    explanation_ready = False
-    explanation_full = None
-    force_exp = None
-    full_exp = None
-    shap_df = None
+def render_shap_section(bundle: ExplanationBundle, result: PredictionResult, total_features: int) -> None:
+    st.subheader("Model Explanation (SHAP)")
+    tab1, tab2, tab3 = st.tabs(["SHAP Guided Force Plot", "Waterfall Plot", "Features Table"])
+
+    with tab1:
+        st.caption(
+            f"Custom force-style SHAP plot with leader lines and indexed labels "
+            f"(top {min(CFG.force_max_display, total_features)} features by absolute SHAP value)."
+        )
+        try:
+            fig_force = plot_guided_force_like(
+                explanation=bundle.force,
+                prediction_value=result.positive_proba,
+                base_value=float(bundle.full.base_values),
+            )
+            st.pyplot(fig_force, use_container_width=True)
+        except Exception as exc:
+            st.error(f"SHAP guided force plot rendering failed: {exc}")
+
+    with tab2:
+        st.caption("Waterfall plot using original feature names.")
+        try:
+            st.pyplot(plot_waterfall(bundle.waterfall, total_features=total_features), use_container_width=True)
+        except Exception as exc:
+            st.error(f"SHAP waterfall plot rendering failed: {exc}")
+
+    with tab3:
+        st.caption("Features ranked by absolute SHAP magnitude.")
+        try:
+            display_df = bundle.table.copy()
+            for col in ("Raw Input", "Standardized Input", "SHAP Value", "Absolute SHAP"):
+                if col in display_df.columns:
+                    display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+            st.dataframe(display_df, use_container_width=True)
+        except Exception as exc:
+            st.error(f"SHAP feature table rendering failed: {exc}")
+
+
+# =========================
+# Main app
+# =========================
+def main() -> None:
+    stop_if_missing([CFG.model_path, CFG.x_train_path, CFG.y_train_path, CFG.scaler_path])
+
+    assets = load_assets()
+    explainer = build_explainer(assets.model, assets.background)
+    total_features = len(assets.feature_names)
+
+    render_header(total_features)
+    render_sidebar(total_features)
+
+    st.subheader("Patient Feature Input")
+    with st.form("prediction_form", clear_on_submit=False):
+        st.markdown(
+            (
+                '<div class="small-muted">'
+                'Enter raw patient-specific radiomics feature values below. '
+                'The app will automatically apply the training-time Z-score transformation before prediction.'
+                '</div>'
+            ),
+            unsafe_allow_html=True,
+        )
+        user_inputs = make_input_widgets(assets.feature_meta, assets.feature_names)
+
+        col1, col2, _ = st.columns([1.2, 1.2, 3.6])
+        with col1:
+            submitted = st.form_submit_button("Run Prediction", type="primary", use_container_width=True)
+        with col2:
+            preview = st.form_submit_button("Preview Inputs", use_container_width=True)
+
+    input_df_raw = build_input_data(user_inputs, assets.feature_names)
+    input_df_model = transform_input_with_scaler(input_df_raw, assets.scaler, assets.feature_names)
+
+    if preview and not submitted:
+        render_preview(input_df_raw, input_df_model)
+
+    if not submitted:
+        st.markdown('<div class="footer-note">Research-use interface for the multimodal model.</div>', unsafe_allow_html=True)
+        return
+
+    result = run_prediction(assets.model, input_df_model)
+    render_prediction_summary(result)
+    render_probability_section(result)
 
     try:
         with st.spinner("Computing SHAP explanation..."):
-            explanation_full = shap_for_single_case(explainer, input_df_model, nsamples=SHAP_NSAMPLES)
-            force_exp = subset_explanation(
-                explanation_full,
-                top_n=min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)
-            )
-            full_exp = subset_explanation(
-                explanation_full,
-                top_n=TOTAL_FEATURES
-            )
-            shap_df = build_shap_table(
-                explanation_full,
-                input_df_raw=input_df_raw,
-                input_df_model=input_df_model
-            )
-        explanation_ready = True
-    except Exception as e:
-        st.error(f"SHAP explanation failed: {e}")
+            bundle = prepare_explanations(explainer, input_df_raw, input_df_model, total_features)
+        render_shap_section(bundle, result, total_features)
+    except Exception as exc:
+        st.error(f"SHAP explanation failed: {exc}")
 
-    if explanation_ready:
-        tab1, tab2, tab3 = st.tabs(["SHAP Guided Force Plot", "Waterfall Plot", "Features Table"])
+    st.markdown('<div class="footer-note">Research-use interface for the multimodal model.</div>', unsafe_allow_html=True)
 
-        with tab1:
-            st.caption(
-                f"Custom force-style SHAP plot with leader lines and indexed labels "
-                f"(top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)} features by absolute SHAP value)."
-            )
-            try:
-                fig_force = plot_guided_force_like(
-                    explanation=force_exp,
-                    prediction_value=positive_proba,
-                    base_value=float(explanation_full.base_values)
-                )
-                st.pyplot(fig_force, use_container_width=True)
-            except Exception as e:
-                st.error(f"SHAP guided force plot rendering failed: {e}")
 
-        with tab2:
-            st.caption("Waterfall plot using original feature names.")
-            try:
-                fig1 = plot_waterfall(full_exp, total_features=TOTAL_FEATURES)
-                st.pyplot(fig1, use_container_width=True)
-            except Exception as e:
-                st.error(f"SHAP waterfall plot rendering failed: {e}")
-
-        with tab3:
-            st.caption("Features ranked by absolute SHAP magnitude.")
-            try:
-                display_df = shap_df.copy()
-                for col in ["Raw Input", "Standardized Input", "SHAP Value", "Absolute SHAP"]:
-                    if col in display_df.columns:
-                        display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
-                st.dataframe(display_df, use_container_width=True)
-            except Exception as e:
-                st.error(f"SHAP feature table rendering failed: {e}")
-
-st.markdown("""
-<div class="footer-note">
-Research-use interface for the multimodal model.
-</div>
-""", unsafe_allow_html=True)
+if __name__ == "__main__":
+    main()
