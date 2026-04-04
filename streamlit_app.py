@@ -21,6 +21,7 @@ APP_DIR = Path(__file__).resolve().parent
 MODEL_PATH = APP_DIR / "SVM_rbf.pkl"
 X_TRAIN_PATH = APP_DIR / "x_train.csv"
 Y_TRAIN_PATH = APP_DIR / "y_train.csv"
+SCALER_PATH = APP_DIR / "zscore_scaler.pkl"
 
 FIXED_THRESHOLD = 0.4629352474478095
 
@@ -137,7 +138,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def check_required_files():
-    required = [MODEL_PATH, X_TRAIN_PATH, Y_TRAIN_PATH]
+    required = [MODEL_PATH, X_TRAIN_PATH, Y_TRAIN_PATH, SCALER_PATH]
     missing = [p.name for p in required if not p.exists()]
     if missing:
         st.error("Missing required files in repository root:")
@@ -163,21 +164,16 @@ def format_widget_label(name: str, max_len: int = 150) -> str:
         return name[:max_len - 1] + "…"
     return name
 
-def safe_stats(series: pd.Series):
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) == 0:
-        return {"min": -1.0, "max": 1.0, "median": 0.0, "q1": -0.5, "q3": 0.5}
-    return {
-        "min": float(np.min(s)),
-        "max": float(np.max(s)),
-        "median": float(np.median(s)),
-        "q1": float(np.percentile(s, 25)),
-        "q3": float(np.percentile(s, 75))
-    }
+def transform_input_with_scaler(input_df_raw: pd.DataFrame, scaler, feature_names) -> pd.DataFrame:
+    X = input_df_raw.copy()
+    X = X[feature_names]
+    X_scaled = scaler.transform(X)
+    return pd.DataFrame(X_scaled, columns=feature_names, index=X.index)
 
 @st.cache_resource(show_spinner=True)
 def load_assets():
     model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
 
     x_train = pd.read_csv(X_TRAIN_PATH)
     x_train = clean_columns(x_train)
@@ -191,17 +187,15 @@ def load_assets():
 
     feature_meta = {}
     for col in feature_names:
-        stats = safe_stats(x_train[col])
         feature_meta[col] = {
-            **stats,
             "group": infer_feature_group(col)
         }
 
     background = x_train.sample(min(BACKGROUND_N, len(x_train)), random_state=42)
-    return model, x_train, y_train, feature_names, feature_meta, background
+    return model, scaler, x_train, y_train, feature_names, feature_meta, background
 
-def predict_positive_proba(model, X_df: pd.DataFrame) -> np.ndarray:
-    proba = model.predict_proba(X_df)
+def predict_positive_proba(model, X_model_df: pd.DataFrame) -> np.ndarray:
+    proba = model.predict_proba(X_model_df)
     return proba[:, 1]
 
 @st.cache_resource(show_spinner=False)
@@ -211,8 +205,8 @@ def build_explainer(_model, background_df):
         return predict_positive_proba(_model, data_df)
     return shap.KernelExplainer(f, background_df.values)
 
-def shap_for_single_case(explainer, input_df, nsamples=160):
-    shap_values = explainer.shap_values(input_df.values, nsamples=nsamples)
+def shap_for_single_case(explainer, input_df_model, nsamples=160):
+    shap_values = explainer.shap_values(input_df_model.values, nsamples=nsamples)
     if isinstance(shap_values, list):
         shap_values = shap_values[0]
 
@@ -224,8 +218,8 @@ def shap_for_single_case(explainer, input_df, nsamples=160):
     return shap.Explanation(
         values=np.array(shap_values).reshape(-1),
         base_values=base_value,
-        data=input_df.iloc[0].values,
-        feature_names=input_df.columns.tolist()
+        data=input_df_model.iloc[0].values,
+        feature_names=input_df_model.columns.tolist()
     )
 
 def subset_explanation(explanation, top_n=None):
@@ -245,20 +239,27 @@ def subset_explanation(explanation, top_n=None):
         feature_names=names[order].tolist()
     )
 
-def build_shap_table(explanation):
+def build_shap_table(explanation, input_df_raw=None, input_df_model=None):
     values = np.array(explanation.values)
     names = np.array(explanation.feature_names)
-    data = np.array(explanation.data)
-
     order = np.argsort(np.abs(values))[::-1]
 
-    return pd.DataFrame({
+    data = {
         "Feature Name": names[order],
-        "Input Value": data[order],
         "SHAP Value": values[order],
         "Absolute SHAP": np.abs(values[order]),
         "Direction": np.where(values[order] >= 0, "Increase response probability", "Decrease response probability")
-    }).sort_values("Absolute SHAP", ascending=False)
+    }
+
+    if input_df_raw is not None:
+        raw_series = input_df_raw.iloc[0]
+        data["Raw Input"] = raw_series.loc[names[order]].values
+
+    if input_df_model is not None:
+        model_series = input_df_model.iloc[0]
+        data["Standardized Input"] = model_series.loc[names[order]].values
+
+    return pd.DataFrame(data).sort_values("Absolute SHAP", ascending=False)
 
 def break_feature_name(name: str, width: int = 24) -> str:
     name = str(name)
@@ -706,22 +707,11 @@ def make_input_widgets(feature_meta, feature_names):
         with st.expander(f"{group_name} ({len(feats)} features)", expanded=False):
             cols = st.columns(3)
             for idx, feat in enumerate(feats):
-                meta = feature_meta[feat]
                 col = cols[idx % 3]
-
-                default_v = float(meta["median"])
-                help_text = (
-                    f"Full name: {feat}\n"
-                    f"Reference median: {meta['median']:.4f}\n"
-                    f"Reference Q1: {meta['q1']:.4f}\n"
-                    f"Reference Q3: {meta['q3']:.4f}"
-                )
-
                 with col:
                     user_values[feat] = st.number_input(
                         label=format_widget_label(feat),
-                        value=default_v,
-                        help=help_text,
+                        value=0.0,
                         format="%.6f",
                         key=f"input_{feat}"
                     )
@@ -742,7 +732,7 @@ def make_interpretation_text(prob_pos, threshold):
     )
 
 check_required_files()
-model, x_train, y_train, feature_names, feature_meta, background = load_assets()
+model, scaler, x_train, y_train, feature_names, feature_meta, background = load_assets()
 explainer = build_explainer(model, background)
 TOTAL_FEATURES = len(feature_names)
 
@@ -759,7 +749,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 st.markdown(
-    f'<div class="note-card">The deployment uses a fixed decision threshold of <b>{FIXED_THRESHOLD:.6f}</b>.</div>',
+    f'<div class="note-card">The deployment uses a fixed decision threshold of <b>{FIXED_THRESHOLD:.6f}</b>. Raw input values will be transformed by the saved Z-score scaler before prediction and SHAP analysis.</div>',
     unsafe_allow_html=True
 )
 
@@ -770,6 +760,7 @@ with st.sidebar:
     st.write(f"**Total Features:** {TOTAL_FEATURES}")
     st.write(f"**Decision threshold:** {FIXED_THRESHOLD:.6f}")
     st.write(f"**Force plot features:** Top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)}")
+    st.write(f"**Scaler:** {SCALER_PATH.name}")
     st.markdown("---")
     st.caption("Research-use interface only. This tool does not replace clinical judgment.")
 
@@ -777,7 +768,7 @@ st.subheader("Patient Feature Input")
 
 with st.form("prediction_form", clear_on_submit=False):
     st.markdown(
-        '<div class="small-muted">Enter patient-specific radiomics feature values below. Features are grouped into Elasticity and Venous-phase CT.</div>',
+        '<div class="small-muted">Enter raw patient-specific radiomics feature values below. The app will automatically apply the training-time Z-score transformation before prediction.</div>',
         unsafe_allow_html=True
     )
     user_inputs = make_input_widgets(feature_meta, feature_names)
@@ -788,14 +779,19 @@ with st.form("prediction_form", clear_on_submit=False):
     with c2:
         preview = st.form_submit_button("Preview Inputs", use_container_width=True)
 
-input_df = pd.DataFrame([[user_inputs[f] for f in feature_names]], columns=feature_names)
+input_df_raw = pd.DataFrame([[user_inputs[f] for f in feature_names]], columns=feature_names)
+input_df_model = transform_input_with_scaler(input_df_raw, scaler, feature_names)
 
 if preview and not submitted:
+    preview_df = pd.DataFrame({
+        "Raw Input": input_df_raw.iloc[0],
+        "Standardized Input": input_df_model.iloc[0]
+    })
     with st.expander("Current Input Table", expanded=True):
-        st.dataframe(input_df.T.rename(columns={0: "Value"}), use_container_width=True)
+        st.dataframe(preview_df, use_container_width=True)
 
 if submitted:
-    positive_proba = float(predict_positive_proba(model, input_df)[0])
+    positive_proba = float(predict_positive_proba(model, input_df_model)[0])
     negative_proba = 1 - positive_proba
     predicted_class = 1 if positive_proba >= FIXED_THRESHOLD else 0
     predicted_label = POSITIVE_LABEL_NAME if predicted_class == 1 else NEGATIVE_LABEL_NAME
@@ -843,7 +839,7 @@ if submitted:
 
     try:
         with st.spinner("Computing SHAP explanation..."):
-            explanation_full = shap_for_single_case(explainer, input_df, nsamples=SHAP_NSAMPLES)
+            explanation_full = shap_for_single_case(explainer, input_df_model, nsamples=SHAP_NSAMPLES)
             force_exp = subset_explanation(
                 explanation_full,
                 top_n=min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)
@@ -852,7 +848,11 @@ if submitted:
                 explanation_full,
                 top_n=TOTAL_FEATURES
             )
-            shap_df = build_shap_table(explanation_full)
+            shap_df = build_shap_table(
+                explanation_full,
+                input_df_raw=input_df_raw,
+                input_df_model=input_df_model
+            )
         explanation_ready = True
     except Exception as e:
         st.error(f"SHAP explanation failed: {e}")
@@ -887,8 +887,9 @@ if submitted:
             st.caption("Features ranked by absolute SHAP magnitude.")
             try:
                 display_df = shap_df.copy()
-                for col in ["Input Value", "SHAP Value", "Absolute SHAP"]:
-                    display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+                for col in ["Raw Input", "Standardized Input", "SHAP Value", "Absolute SHAP"]:
+                    if col in display_df.columns:
+                        display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
                 st.dataframe(display_df, use_container_width=True)
             except Exception as e:
                 st.error(f"SHAP feature table rendering failed: {e}")
