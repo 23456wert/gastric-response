@@ -215,9 +215,55 @@ def mpl_rc(params: dict):
         plt.rcParams.update(old_rc)
 
 
+def normalize_feature_name(name) -> str:
+    return str(name).replace("\ufeff", "").strip()
+
+
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [normalize_feature_name(c) for c in df.columns]
     removable = [c for c in ("ID", "Id", "id", "Unnamed: 0") if c in df.columns]
     return df.drop(columns=removable, errors="ignore") if removable else df
+
+
+def get_expected_feature_names(model, scaler, x_train: pd.DataFrame) -> list[str]:
+    if hasattr(scaler, "feature_names_in_"):
+        return [normalize_feature_name(c) for c in scaler.feature_names_in_]
+    if hasattr(model, "feature_names_in_"):
+        return [normalize_feature_name(c) for c in model.feature_names_in_]
+    return [normalize_feature_name(c) for c in x_train.columns]
+
+
+def align_dataframe_to_features(df: pd.DataFrame, expected_features: list[str], *, frame_name: str) -> pd.DataFrame:
+    aligned = df.copy()
+    aligned.columns = [normalize_feature_name(c) for c in aligned.columns]
+
+    col_map = {}
+    duplicated = []
+    for col in aligned.columns:
+        if col in col_map:
+            duplicated.append(col)
+        else:
+            col_map[col] = col
+
+    if duplicated:
+        dup_preview = ", ".join(sorted(set(duplicated))[:10])
+        raise ValueError(f"{frame_name} contains duplicated feature names after normalization: {dup_preview}")
+
+    missing = [c for c in expected_features if c not in col_map]
+    extra = [c for c in aligned.columns if c not in expected_features]
+    if missing:
+        msg = [f"{frame_name} does not match the saved scaler/model feature set."]
+        msg.append(f"Missing features ({len(missing)}): {', '.join(missing[:8])}")
+        if len(missing) > 8:
+            msg.append("...")
+        if extra:
+            msg.append(f"Unexpected features ({len(extra)}): {', '.join(extra[:8])}")
+            if len(extra) > 8:
+                msg.append("...")
+        raise ValueError(" | ".join(msg))
+
+    return aligned.loc[:, expected_features]
 
 
 def infer_feature_group(feature_name: str) -> str:
@@ -279,14 +325,15 @@ def load_assets() -> Assets:
     model = joblib.load(CFG.model_path)
     scaler = joblib.load(CFG.scaler_path)
 
-    x_train = clean_columns(pd.read_csv(CFG.x_train_path))
+    x_train_raw = clean_columns(pd.read_csv(CFG.x_train_path))
+    feature_names = get_expected_feature_names(model, scaler, x_train_raw)
+    x_train = align_dataframe_to_features(x_train_raw, feature_names, frame_name="x_train.csv")
 
     y_train_df = pd.read_csv(CFG.y_train_path)
     if "label" not in y_train_df.columns:
         raise ValueError("y_train.csv missing column 'label'")
     y_train = y_train_df["label"].astype(int).to_numpy()
 
-    feature_names = list(x_train.columns)
     feature_meta = {name: {"group": infer_feature_group(name)} for name in feature_names}
     background = x_train.sample(min(CFG.background_n, len(x_train)), random_state=42)
 
@@ -311,8 +358,8 @@ def build_explainer(_model, background_df: pd.DataFrame):
 
 
 def transform_input_with_scaler(input_df_raw: pd.DataFrame, scaler, feature_names: list[str]) -> pd.DataFrame:
-    x = input_df_raw[feature_names].copy()
-    x_scaled = scaler.transform(x)
+    x = align_dataframe_to_features(input_df_raw, feature_names, frame_name="input data")
+    x_scaled = scaler.transform(x.to_numpy())
     return pd.DataFrame(x_scaled, columns=feature_names, index=x.index)
 
 
