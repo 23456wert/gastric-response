@@ -239,40 +239,15 @@ def break_feature_name(name: str, width: int) -> str:
     return textwrap.fill(name, width=width, break_long_words=False, break_on_hyphens=False)
 
 
-def resolve_feature_names(x_train_columns, scaler, model) -> list[str]:
-    x_cols = list(normalize_feature_names(x_train_columns))
-    scaler_cols = []
-    model_cols = []
-
-    if hasattr(scaler, "feature_names_in_"):
-        scaler.feature_names_in_ = normalize_feature_names(scaler.feature_names_in_).to_numpy()
-        scaler_cols = list(scaler.feature_names_in_)
-
-    if hasattr(model, "feature_names_in_"):
-        model.feature_names_in_ = normalize_feature_names(model.feature_names_in_).to_numpy()
-        model_cols = list(model.feature_names_in_)
-
-    if scaler_cols:
-        feature_names = list(scaler_cols)
-        for c in model_cols:
-            if c not in feature_names:
-                feature_names.append(c)
-        return feature_names
-
-    if model_cols:
-        feature_names = list(model_cols)
-        for c in x_cols:
-            if c not in feature_names:
-                feature_names.append(c)
-        return feature_names
-
-    return x_cols
-
-
-def align_background_df(df: pd.DataFrame, feature_names: list[str]) -> pd.DataFrame:
-    out = df.copy()
-    out = out.reindex(columns=feature_names, fill_value=0.0)
-    return out
+def align_estimator_feature_names(estimator, feature_names: list[str]) -> None:
+    if hasattr(estimator, "n_features_in_"):
+        if int(estimator.n_features_in_) != len(feature_names):
+            raise ValueError(
+                f"Feature count mismatch: x_train.csv has {len(feature_names)} features, "
+                f"but saved estimator expects {int(estimator.n_features_in_)} features."
+            )
+    if hasattr(estimator, "feature_names_in_"):
+        estimator.feature_names_in_ = np.asarray(feature_names, dtype=object)
 
 
 def render_metric_card(title: str, value: str, sub: str = "") -> None:
@@ -313,8 +288,10 @@ def load_assets() -> Assets:
     scaler = joblib.load(CFG.scaler_path)
 
     x_train = clean_columns(pd.read_csv(CFG.x_train_path))
-    feature_names = resolve_feature_names(x_train.columns, scaler, model)
-    x_train = align_background_df(x_train, feature_names)
+    feature_names = list(x_train.columns)
+
+    align_estimator_feature_names(scaler, feature_names)
+    align_estimator_feature_names(model, feature_names)
 
     y_train_df = pd.read_csv(CFG.y_train_path)
     if "label" not in y_train_df.columns:
@@ -322,7 +299,7 @@ def load_assets() -> Assets:
     y_train = y_train_df["label"].astype(int).to_numpy()
 
     feature_meta = {name: {"group": infer_feature_group(name)} for name in feature_names}
-    background = x_train.sample(min(CFG.background_n, len(x_train)), random_state=42)
+    background = x_train[feature_names].sample(min(CFG.background_n, len(x_train)), random_state=42)
 
     return Assets(
         model=model,
@@ -345,36 +322,18 @@ def build_explainer(_model, background_df: pd.DataFrame):
 
 
 def transform_input_with_scaler(input_df_raw: pd.DataFrame, scaler, feature_names: list[str]) -> pd.DataFrame:
-    x_raw = input_df_raw.reindex(columns=feature_names, fill_value=0.0).copy()
-
-    if hasattr(scaler, "feature_names_in_"):
-        scaler_features = list(scaler.feature_names_in_)
-        x_to_scale = x_raw.reindex(columns=scaler_features, fill_value=0.0)
-        x_scaled_arr = scaler.transform(x_to_scale)
-        x_scaled = pd.DataFrame(x_scaled_arr, columns=scaler_features, index=x_raw.index)
-
-        for col in feature_names:
-            if col not in x_scaled.columns:
-                x_scaled[col] = x_raw[col].values
-
-        x_scaled = x_scaled.reindex(columns=feature_names)
-        return x_scaled
-
-    return x_raw
+    x = input_df_raw[feature_names].copy()
+    x_scaled = scaler.transform(x)
+    return pd.DataFrame(x_scaled, columns=feature_names, index=x.index)
 
 
 def predict_positive_proba(model, x_model_df: pd.DataFrame) -> np.ndarray:
     x = x_model_df.copy()
-
-    if hasattr(model, "feature_names_in_"):
-        model_features = list(model.feature_names_in_)
-        x = x.reindex(columns=model_features, fill_value=0.0)
-
     return model.predict_proba(x)[:, 1]
 
 
 def build_input_data(user_inputs: dict[str, float], feature_names: list[str]) -> pd.DataFrame:
-    return pd.DataFrame([[user_inputs.get(name, 0.0) for name in feature_names]], columns=feature_names)
+    return pd.DataFrame([[user_inputs[name] for name in feature_names]], columns=feature_names)
 
 
 def run_prediction(model, input_df_model: pd.DataFrame) -> PredictionResult:
@@ -443,11 +402,11 @@ def build_shap_table(
 
     if input_df_raw is not None:
         raw_series = input_df_raw.iloc[0]
-        data["Raw Input"] = raw_series.reindex(names[order]).to_numpy()
+        data["Raw Input"] = raw_series.loc[names[order]].to_numpy()
 
     if input_df_model is not None:
         model_series = input_df_model.iloc[0]
-        data["Standardized Input"] = model_series.reindex(names[order]).to_numpy()
+        data["Standardized Input"] = model_series.loc[names[order]].to_numpy()
 
     return pd.DataFrame(data).sort_values("Absolute SHAP", ascending=False)
 
