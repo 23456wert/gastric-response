@@ -1,6 +1,5 @@
 from pathlib import Path
 import textwrap
-import re
 
 import joblib
 import shap
@@ -34,15 +33,6 @@ APP_SUBTITLE = "Multimodal venous-phase CT and elasticity radiomics model for in
 
 POSITIVE_LABEL_NAME = "Responder"
 NEGATIVE_LABEL_NAME = "Non-responder"
-
-CLASS_NAME_MAP = {
-    0: "Non-responder",
-    1: "Responder",
-    "0": "Non-responder",
-    "1": "Responder",
-    0.0: "Non-responder",
-    1.0: "Responder",
-}
 
 SHAP_NSAMPLES = 160
 BACKGROUND_N = 30
@@ -162,48 +152,6 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = df.drop(columns=drop_cols, errors="ignore")
     return df
 
-def normalize_sep_name(name: str) -> str:
-    name = str(name).strip().lower()
-    name = re.sub(r"[\s]+", "", name)
-    name = re.sub(r"[-_]+", "", name)
-    return name
-
-def align_dataframe_columns_by_target_names(df: pd.DataFrame, target_feature_names):
-    current_cols = list(df.columns)
-    norm_to_current = {}
-    for c in current_cols:
-        norm_to_current.setdefault(normalize_sep_name(c), []).append(c)
-
-    selected_cols = []
-    missing = []
-    ambiguous = []
-
-    for name in target_feature_names:
-        if name in df.columns:
-            selected_cols.append(name)
-            continue
-
-        norm_name = normalize_sep_name(name)
-        candidates = norm_to_current.get(norm_name, [])
-
-        if len(candidates) == 1:
-            selected_cols.append(candidates[0])
-        elif len(candidates) == 0:
-            missing.append(name)
-        else:
-            ambiguous.append((name, candidates))
-
-    if missing:
-        raise ValueError("Missing required features:\n" + "\n".join(map(str, missing)))
-
-    if ambiguous:
-        msg = ["{} --> {}".format(k, v) for k, v in ambiguous]
-        raise ValueError("Ambiguous feature mapping:\n" + "\n".join(msg))
-
-    aligned = df[selected_cols].copy()
-    aligned.columns = list(target_feature_names)
-    return aligned
-
 def infer_feature_group(feature_name: str) -> str:
     if "Elasticity" in feature_name:
         return "Elasticity Features"
@@ -216,21 +164,11 @@ def format_widget_label(name: str, max_len: int = 150) -> str:
         return name[:max_len - 1] + "…"
     return name
 
-def resolve_class_display_names(classes_):
-    display_names = []
-    for c in classes_:
-        if c in CLASS_NAME_MAP:
-            display_names.append(CLASS_NAME_MAP[c])
-        elif str(c) in CLASS_NAME_MAP:
-            display_names.append(CLASS_NAME_MAP[str(c)])
-        else:
-            display_names.append(str(c))
-    return display_names
-
-def transform_input_with_scaler(input_df_raw: pd.DataFrame, scaler, scaler_feature_names) -> pd.DataFrame:
-    X = align_dataframe_columns_by_target_names(input_df_raw, scaler_feature_names)
+def transform_input_with_scaler(input_df_raw: pd.DataFrame, scaler, feature_names) -> pd.DataFrame:
+    X = input_df_raw.copy()
+    X = X[feature_names]
     X_scaled = scaler.transform(X)
-    return pd.DataFrame(X_scaled, columns=scaler_feature_names, index=X.index)
+    return pd.DataFrame(X_scaled, columns=feature_names, index=X.index)
 
 @st.cache_resource(show_spinner=True)
 def load_assets():
@@ -246,70 +184,45 @@ def load_assets():
     y_train = y_train["label"].astype(int).values
 
     if hasattr(scaler, "feature_names_in_"):
-        scaler_feature_names = list(scaler.feature_names_in_)
+        feature_names = list(scaler.feature_names_in_)
     else:
-        scaler_feature_names = list(x_train.columns)
+        feature_names = list(x_train.columns)
 
-    x_train_scaled_space = align_dataframe_columns_by_target_names(x_train, scaler_feature_names)
+    missing_in_xtrain = [c for c in feature_names if c not in x_train.columns]
+    if missing_in_xtrain:
+        raise ValueError(
+            "x_train.csv 缺少以下 scaler 所需特征：\n" + "\n".join(missing_in_xtrain)
+        )
+
+    x_train = x_train[feature_names]
 
     if hasattr(model, "feature_names_in_"):
         model_feature_names = list(model.feature_names_in_)
-        x_train_model_space = align_dataframe_columns_by_target_names(x_train_scaled_space, model_feature_names)
-
-        scaler_norm = [normalize_sep_name(x) for x in scaler_feature_names]
-        model_norm = [normalize_sep_name(x) for x in model_feature_names]
-        if scaler_norm != model_norm:
+        if model_feature_names != feature_names:
             raise ValueError(
-                "model.feature_names_in_ and scaler.feature_names_in_ are not aligned."
+                "model.feature_names_in_ 与 scaler.feature_names_in_ 不一致。\n"
+                f"model 前5列: {model_feature_names[:5]}\n"
+                f"scaler 前5列: {feature_names[:5]}"
             )
-    else:
-        model_feature_names = list(scaler_feature_names)
-        x_train_model_space = x_train_scaled_space.copy()
 
     feature_meta = {}
-    for col in scaler_feature_names:
-        feature_meta[col] = {"group": infer_feature_group(col)}
+    for col in feature_names:
+        feature_meta[col] = {
+            "group": infer_feature_group(col)
+        }
 
-    background = x_train_model_space.sample(min(BACKGROUND_N, len(x_train_model_space)), random_state=42)
+    background = x_train.sample(min(BACKGROUND_N, len(x_train)), random_state=42)
+    return model, scaler, x_train, y_train, feature_names, feature_meta, background
 
-    classes_ = model.classes_ if hasattr(model, "classes_") else np.array([0, 1])
-    class_display_names = resolve_class_display_names(classes_)
-
-    return (
-        model,
-        scaler,
-        scaler_feature_names,
-        model_feature_names,
-        x_train_model_space,
-        y_train,
-        feature_meta,
-        background,
-        classes_,
-        class_display_names,
-    )
-
-def predict_class_probabilities(model, input_df_model: pd.DataFrame, model_feature_names, classes_):
-    X_model = align_dataframe_columns_by_target_names(input_df_model, model_feature_names)
-    proba = model.predict_proba(X_model)
-    return proba, classes_
-
-def get_probability_dict(proba_row, classes_):
-    display_names = resolve_class_display_names(classes_)
-    return {display_names[i]: float(proba_row[i]) for i in range(len(display_names))}
-
-def get_positive_proba_from_row(proba_row, classes_):
-    prob_map = get_probability_dict(proba_row, classes_)
-    if POSITIVE_LABEL_NAME not in prob_map:
-        raise ValueError(f"Could not find '{POSITIVE_LABEL_NAME}' in model.classes_ mapping: {prob_map}")
-    return float(prob_map[POSITIVE_LABEL_NAME])
+def predict_positive_proba(model, X_model_df: pd.DataFrame) -> np.ndarray:
+    proba = model.predict_proba(X_model_df)
+    return proba[:, 1]
 
 @st.cache_resource(show_spinner=False)
-def build_explainer(_model, background_df, model_feature_names, classes_):
+def build_explainer(_model, background_df):
     def f(data):
         data_df = pd.DataFrame(data, columns=background_df.columns)
-        proba, _classes = predict_class_probabilities(_model, data_df, model_feature_names, classes_)
-        positive_probs = np.array([get_positive_proba_from_row(row, _classes) for row in proba])
-        return positive_probs
+        return predict_positive_proba(_model, data_df)
     return shap.KernelExplainer(f, background_df.values)
 
 def shap_for_single_case(explainer, input_df_model, nsamples=160):
@@ -359,12 +272,12 @@ def build_shap_table(explanation, input_df_raw=None, input_df_model=None):
     }
 
     if input_df_raw is not None:
-        raw_aligned = align_dataframe_columns_by_target_names(input_df_raw, names[order].tolist())
-        data["Raw Input"] = raw_aligned.iloc[0].values
+        raw_series = input_df_raw.iloc[0]
+        data["Raw Input"] = raw_series.loc[names[order]].values
 
     if input_df_model is not None:
-        model_aligned = align_dataframe_columns_by_target_names(input_df_model, names[order].tolist())
-        data["Standardized Input"] = model_aligned.iloc[0].values
+        model_series = input_df_model.iloc[0]
+        data["Standardized Input"] = model_series.loc[names[order]].values
 
     return pd.DataFrame(data).sort_values("Absolute SHAP", ascending=False)
 
@@ -761,18 +674,11 @@ def plot_waterfall(explanation, total_features):
     plt.rcParams.update(old_rc)
     return fig
 
-def plot_probability_bar(prob_dict):
-    positive_proba = float(prob_dict.get(POSITIVE_LABEL_NAME, np.nan))
-    negative_proba = float(prob_dict.get(NEGATIVE_LABEL_NAME, np.nan))
-
-    if np.isnan(positive_proba) or np.isnan(negative_proba):
-        labels = list(prob_dict.keys())
-        probs = [float(prob_dict[k]) for k in labels]
-    else:
-        labels = [NEGATIVE_LABEL_NAME, POSITIVE_LABEL_NAME]
-        probs = [negative_proba, positive_proba]
-
-    colors = ["#b9c6d6", "#2f7ed8"] if len(probs) == 2 else None
+def plot_probability_bar(prob_pos):
+    prob_neg = 1 - prob_pos
+    labels = [NEGATIVE_LABEL_NAME, POSITIVE_LABEL_NAME]
+    probs = [prob_neg, prob_pos]
+    colors = ["#b9c6d6", "#2f7ed8"]
 
     fig, ax = plt.subplots(figsize=(9, 2.8), dpi=300)
     bars = ax.barh(labels, probs, color=colors, edgecolor="none")
@@ -782,11 +688,11 @@ def plot_probability_bar(prob_dict):
     ax.set_title("Predicted Class Probabilities", fontsize=13, fontweight="bold")
 
     for bar, val in zip(bars, probs):
-        x = min(float(val) + 0.015, 0.96)
+        x = min(val + 0.015, 0.96)
         ax.text(
             x,
             bar.get_y() + bar.get_height() / 2,
-            f"{float(val):.3f}",
+            f"{val:.3f}",
             va="center",
             ha="left",
             fontsize=10,
@@ -832,37 +738,23 @@ def make_input_widgets(feature_meta, feature_names):
 
     return user_values
 
-def make_interpretation_text(positive_proba, threshold, predicted_label):
-    if np.isnan(positive_proba):
-        return f"The model predicts this patient as {predicted_label}."
-    if positive_proba >= threshold:
+def make_interpretation_text(prob_pos, threshold):
+    if prob_pos >= threshold:
         return (
-            f"The estimated probability of response is {positive_proba:.3f}, "
+            f"The estimated probability of response is {prob_pos:.3f}, "
             f"which is above the threshold ({threshold:.6f}). "
-            f"The model classifies this patient as a {predicted_label}."
+            f"The model classifies this patient as a {POSITIVE_LABEL_NAME}."
         )
     return (
-        f"The estimated probability of response is {positive_proba:.3f}, "
+        f"The estimated probability of response is {prob_pos:.3f}, "
         f"which is below the threshold ({threshold:.6f}). "
-        f"The model classifies this patient as a {predicted_label}."
+        f"The model classifies this patient as a {NEGATIVE_LABEL_NAME}."
     )
 
 check_required_files()
-(
-    model,
-    scaler,
-    scaler_feature_names,
-    model_feature_names,
-    x_train_model_space,
-    y_train,
-    feature_meta,
-    background,
-    classes_,
-    class_display_names
-) = load_assets()
-
-explainer = build_explainer(model, background, model_feature_names, classes_)
-TOTAL_FEATURES = len(scaler_feature_names)
+model, scaler, x_train, y_train, feature_names, feature_meta, background = load_assets()
+explainer = build_explainer(model, background)
+TOTAL_FEATURES = len(feature_names)
 
 st.markdown(f"""
 <div class="hero-card">
@@ -877,7 +769,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 st.markdown(
-    f'<div class="note-card">The deployment uses a fixed decision threshold of <b>{FIXED_THRESHOLD:.6f}</b>. Raw input values will be transformed by the saved Z-score scaler, then reordered to the model feature order before prediction and SHAP analysis.</div>',
+    f'<div class="note-card">The deployment uses a fixed decision threshold of <b>{FIXED_THRESHOLD:.6f}</b>. Raw input values will be transformed by the saved Z-score scaler before prediction and SHAP analysis.</div>',
     unsafe_allow_html=True
 )
 
@@ -889,8 +781,6 @@ with st.sidebar:
     st.write(f"**Decision threshold:** {FIXED_THRESHOLD:.6f}")
     st.write(f"**Force plot features:** Top {min(FORCE_MAX_DISPLAY, TOTAL_FEATURES)}")
     st.write(f"**Scaler:** {SCALER_PATH.name}")
-    st.write(f"**Model classes:** {list(classes_)}")
-    st.write(f"**Class names:** {class_display_names}")
     st.markdown("---")
     st.caption("Research-use interface only. This tool does not replace clinical judgment.")
 
@@ -898,10 +788,10 @@ st.subheader("Patient Feature Input")
 
 with st.form("prediction_form", clear_on_submit=False):
     st.markdown(
-        '<div class="small-muted">Enter raw patient-specific radiomics feature values below. The app will automatically apply the saved Z-score scaler and the model feature-order alignment used by the document script.</div>',
+        '<div class="small-muted">Enter raw patient-specific radiomics feature values below. The app will automatically apply the training-time Z-score transformation before prediction.</div>',
         unsafe_allow_html=True
     )
-    user_inputs = make_input_widgets(feature_meta, scaler_feature_names)
+    user_inputs = make_input_widgets(feature_meta, feature_names)
 
     c1, c2, c3 = st.columns([1.2, 1.2, 3.6])
     with c1:
@@ -909,33 +799,22 @@ with st.form("prediction_form", clear_on_submit=False):
     with c2:
         preview = st.form_submit_button("Preview Inputs", use_container_width=True)
 
-input_df_raw = pd.DataFrame([[user_inputs[f] for f in scaler_feature_names]], columns=scaler_feature_names)
-input_df_scaled = transform_input_with_scaler(input_df_raw, scaler, scaler_feature_names)
-input_df_model = align_dataframe_columns_by_target_names(input_df_scaled, model_feature_names)
+input_df_raw = pd.DataFrame([[user_inputs[f] for f in feature_names]], columns=feature_names)
+input_df_model = transform_input_with_scaler(input_df_raw, scaler, feature_names)
 
 if preview and not submitted:
     preview_df = pd.DataFrame({
-        "Raw Input": align_dataframe_columns_by_target_names(input_df_raw, scaler_feature_names).iloc[0],
-        "Standardized Input": align_dataframe_columns_by_target_names(input_df_scaled, scaler_feature_names).iloc[0]
+        "Raw Input": input_df_raw.iloc[0],
+        "Standardized Input": input_df_model.iloc[0]
     })
     with st.expander("Current Input Table", expanded=True):
         st.dataframe(preview_df, use_container_width=True)
 
 if submitted:
-    proba, classes_ = predict_class_probabilities(model, input_df_model, model_feature_names, classes_)
-    prob_dict = get_probability_dict(proba[0], classes_)
-
-    positive_proba = float(prob_dict.get(POSITIVE_LABEL_NAME, np.nan))
-    negative_proba = float(prob_dict.get(NEGATIVE_LABEL_NAME, np.nan))
-
-    predicted_idx = int(np.argmax(proba[0]))
-    predicted_label = resolve_class_display_names(classes_)[predicted_idx]
-
-    if np.isnan(positive_proba):
-        predicted_class = predicted_idx
-    else:
-        predicted_class = 1 if positive_proba >= FIXED_THRESHOLD else 0
-        predicted_label = POSITIVE_LABEL_NAME if predicted_class == 1 else NEGATIVE_LABEL_NAME
+    positive_proba = float(predict_positive_proba(model, input_df_model)[0])
+    negative_proba = 1 - positive_proba
+    predicted_class = 1 if positive_proba >= FIXED_THRESHOLD else 0
+    predicted_label = POSITIVE_LABEL_NAME if predicted_class == 1 else NEGATIVE_LABEL_NAME
 
     st.subheader("Prediction Summary")
     c1, c2, c3 = st.columns(3)
@@ -956,18 +835,17 @@ if submitted:
             unsafe_allow_html=True
         )
 
-    if not np.isnan(positive_proba):
-        st.progress(int(round(positive_proba * 100)))
+    st.progress(int(round(positive_proba * 100)))
 
-    interpretation_text = make_interpretation_text(positive_proba, FIXED_THRESHOLD, predicted_label)
-    if predicted_label == POSITIVE_LABEL_NAME:
+    interpretation_text = make_interpretation_text(positive_proba, FIXED_THRESHOLD)
+    if predicted_class == 1:
         st.markdown(f'<div class="result-positive">{interpretation_text}</div>', unsafe_allow_html=True)
     else:
         st.markdown(f'<div class="result-negative">{interpretation_text}</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.subheader("Probability Visualization")
-    prob_fig = plot_probability_bar(prob_dict)
+    prob_fig = plot_probability_bar(positive_proba)
     st.pyplot(prob_fig, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1010,7 +888,7 @@ if submitted:
             try:
                 fig_force = plot_guided_force_like(
                     explanation=force_exp,
-                    prediction_value=positive_proba if not np.isnan(positive_proba) else float(np.max(proba[0])),
+                    prediction_value=positive_proba,
                     base_value=float(explanation_full.base_values)
                 )
                 st.pyplot(fig_force, use_container_width=True)
